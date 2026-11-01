@@ -209,6 +209,8 @@ test('the real aborter treats an unreachable, relocated, failing or hung service
   assert.equal(await openCodeAborter({service:{...fakeService(),discover:async()=>{throw Error('x');}},connect:probe().connect})(target),false);
   assert.equal(await openCodeAborter({service:fakeService(),connect:probe(async()=>{throw Error('x');}).connect})(target),false);
   assert.equal(await openCodeAborter({service:fakeService(),connect:probe(()=>new Promise(()=>{})).connect,timeoutMs:20})(target),false);
+  // A discovery that hangs is bounded by the same deadline: recovery gates every queue.
+  assert.equal(await openCodeAborter({service:{...fakeService(),discover:()=>new Promise(()=>{})},connect:probe().connect,timeoutMs:20})(target),false);
 });
 
 const notFound=(sessionID='s1')=>({_tag:'SessionNotFoundError',sessionID,message:'Session not found'});

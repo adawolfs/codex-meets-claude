@@ -14,12 +14,16 @@ const bare = url => { const u = new URL(url); u.username = u.password = u.search
 // proof. It never starts a service, and an unregistered one proves nothing: `opencode serve` may run elsewhere.
 export const openCodeAborter = ({ service = Service, connect = o => OpenCode.make(o), timeoutMs = 5000 } = {}) => async ({ sessionId, endpoint }) => {
   let timer;
-  try {
+  // Discovery is inside the deadline too: recovery gates every provider's queue.
+  const attempt = async () => {
     const live = await service.discover();
     // The recorded endpoint carries no credentials; a service elsewhere is a different instance.
     if (!live || bare(live.url) !== bare(endpoint)) return false;
     const client = connect({ baseUrl: live.url, headers: service.headers(live) });
-    return await Promise.race([(async () => client.session.interrupt({ sessionID: sessionId }))().then(() => true, e => isSessionNotFoundError(e) && e.sessionID === sessionId), new Promise(r => { timer = setTimeout(r, timeoutMs, false); })]);
+    return (async () => client.session.interrupt({ sessionID: sessionId }))().then(() => true, e => isSessionNotFoundError(e) && e.sessionID === sessionId);
+  };
+  try {
+    return await Promise.race([attempt(), new Promise(r => { timer = setTimeout(r, timeoutMs, false); })]);
   } catch { return false; } finally { clearTimeout(timer); }
 };
 export function validateStart(provider, input) {
