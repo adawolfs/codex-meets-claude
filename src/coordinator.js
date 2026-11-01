@@ -1,8 +1,22 @@
 import { randomUUID } from 'node:crypto';
+import { OpenCode } from '@opencode/client';
+import { Service } from '@opencode/client/service';
 import { resolveProject as defaultResolve } from './paths.js';
 import { pageArgs } from './store.js';
 import { PROVIDERS, LEVELS } from './persistent-tools.js';
 const timestamp = () => new Date().toISOString();
+const bare = url => { const u = new URL(url); u.username = u.password = u.search = u.hash = ''; return u.href.replace(/\/$/, ''); };
+// True only when the recorded service answered an interrupt. It never starts a service: an absent one has proven nothing.
+export const openCodeAborter = ({ service = Service, connect = o => OpenCode.make(o), timeoutMs = 5000 } = {}) => async ({ sessionId, endpoint }) => {
+  let timer;
+  try {
+    const live = await service.discover();
+    // The recorded endpoint carries no credentials; a service elsewhere is a different instance.
+    if (!live || bare(live.url) !== bare(endpoint)) return false;
+    const client = connect({ baseUrl: live.url, headers: service.headers(live) });
+    return await Promise.race([(async () => client.session.interrupt({ sessionID: sessionId }))().then(() => true), new Promise(r => { timer = setTimeout(r, timeoutMs, false); })]);
+  } catch { return false; } finally { clearTimeout(timer); }
+};
 export function validateStart(provider, input) {
   if (!PROVIDERS.includes(provider)) throw Error('Invalid provider');
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw Error('arguments must be an object');
@@ -21,12 +35,12 @@ export function validateStart(provider, input) {
     ...(provider === 'claude' ? {permissionMode: input.permissionMode ?? 'plan',maxTurns: input.maxTurns ?? 50} : provider === 'opencode' ? {level: input.level ?? 'read-only',worktree: input.worktree ?? false} : {}) };
 }
 export class Coordinator {
-  constructor({ store, runner, resolveProject = defaultResolve, maxActive = 4, maxQueued = 100, onFatal = error => { console.error('Storage failure:',error.message); process.exitCode=1; } }) {
+  constructor({ store, runner, resolveProject = defaultResolve, maxActive = 4, maxQueued = 100, abortSession = openCodeAborter(), onFatal = error => { console.error('Storage failure:',error.message); process.exitCode=1; } }) {
     for (const n of [maxActive,maxQueued]) if (!Number.isSafeInteger(n) || n < 1) throw Error('Invalid queue limit');
     Object.assign(this,{store,runner,resolveProject,maxActive,maxQueued,onFatal});
-    this.active=new Map();this.closing=false;this.pumping=false;
-    store.recover();store.prune();
-    queueMicrotask(()=>this.pump());
+    this.active=new Map();this.closing=false;this.pumping=false;this.recovered=false;
+    // Nothing is eligible until recovery has settled; a row it could not release keeps its project out of pump.
+    store.recover({abortSession}).then(()=>{if(this.closing)return;store.prune();this.recovered=true;this.pump();}).catch(error=>{if(!this.closing)this.fail(error);});
   }
   async start(provider,input) {
     if (this.closing) throw Error('Service is shutting down');
@@ -51,12 +65,13 @@ export class Coordinator {
     return view;
   }
   pump() {
-    if(this.closing||this.pumping)return;
+    if(this.closing||this.pumping||!this.recovered)return;
     this.pumping=true;
     try {
+      const held=new Set(this.store.unrecovered(new Set(this.active.keys())).map(r=>r.project));
       for(const job of this.store.queued()){
         if(this.active.size>=this.maxActive)break;
-        const busy=[...this.active.values()].some(a=>a.project===job.project ||
+        const busy=held.has(job.project)||[...this.active.values()].some(a=>a.project===job.project ||
           (job.args.sessionId && a.provider===job.provider && a.sessionId===job.args.sessionId));
         if(busy)continue;
         this.store.update(job.id,{status:'running',startedAt:timestamp(),progress:{phase:'starting',text:''}});
@@ -103,7 +118,7 @@ export class Coordinator {
     return this.store.get(provider,id);
   }
   diagnostics(){
-    return {version:'0.3.0',status:this.closing?'stopping':'ready',counts:this.store.counts(),
+    return {version:'0.3.0',status:this.closing?'stopping':'ready',counts:this.store.counts(),unrecovered:this.store.unrecovered(new Set(this.active.keys())).length,
       limits:{maxActive:this.maxActive,maxQueued:this.maxQueued,maxHistory:this.store.maxHistory,maxAgeMs:this.store.maxAgeMs,maxEvents:this.store.maxEvents}};
   }
   async shutdown(){
