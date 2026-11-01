@@ -3,6 +3,7 @@ import { mkdirSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 
+const BACKENDS = { claude: 'agent-sdk', codex: 'codex-exec', opencode: 'opencode-http' };
 export const terminal = status => !['queued', 'running'].includes(status);
 export function pageArgs({ after = 0, limit = 50 } = {}) {
   if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 100)
@@ -32,7 +33,7 @@ export class Store {
   insert(provider, args, project, original = args) {
     const prior = this.findRequest(provider, original);
     if (prior) return prior;
-    const view = { id: randomUUID(), provider, backend: provider === 'claude' ? 'agent-sdk' : 'codex-exec',
+    const view = { id: randomUUID(), provider, backend: BACKENDS[provider],
       status: 'queued', queuedAt: new Date().toISOString(), startedAt: null, cwd: args.cwd,
       sessionId: args.sessionId ?? null, parentJobId: args.parentJobId ?? null,
       requestId: args.requestId, result: null, error: null, progress: { phase: 'queued', text: '' } };

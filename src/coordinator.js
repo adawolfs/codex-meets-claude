@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { resolveProject as defaultResolve } from './paths.js';
 import { pageArgs } from './store.js';
+import { PROVIDERS, LEVELS } from './persistent-tools.js';
 const timestamp = () => new Date().toISOString();
 export function validateStart(provider, input) {
-  if (!['claude','codex'].includes(provider)) throw Error('Invalid provider');
+  if (!PROVIDERS.includes(provider)) throw Error('Invalid provider');
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw Error('arguments must be an object');
-  const keys = ['prompt','cwd','sessionId','model','requestId','parentJobId',...(provider === 'claude' ? ['permissionMode','maxTurns','maxBudgetUsd'] : [])];
+  const keys = ['prompt','cwd','sessionId','model','requestId','parentJobId',...(provider === 'claude' ? ['permissionMode','maxTurns','maxBudgetUsd'] : provider === 'opencode' ? ['level','worktree'] : [])];
   for (const key of Object.keys(input)) if (!keys.includes(key)) throw Error('Unknown argument: '+key);
   if (typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 100000) throw Error('Invalid prompt (1-100000 characters)');
   if (typeof input.cwd !== 'string' || !input.cwd || input.cwd.length > 4096) throw Error('Invalid cwd');
@@ -14,8 +15,10 @@ export function validateStart(provider, input) {
   if (input.permissionMode !== undefined && !['plan','acceptEdits'].includes(input.permissionMode)) throw Error('Invalid permissionMode');
   if (input.maxTurns !== undefined && (!Number.isSafeInteger(input.maxTurns) || input.maxTurns < 1 || input.maxTurns > 1000)) throw Error('Invalid maxTurns');
   if (input.maxBudgetUsd !== undefined && (typeof input.maxBudgetUsd !== 'number' || !Number.isFinite(input.maxBudgetUsd) || input.maxBudgetUsd <= 0)) throw Error('Invalid maxBudgetUsd');
+  if (input.level !== undefined && !LEVELS.includes(input.level)) throw Error('Invalid level');
+  if (input.worktree !== undefined && typeof input.worktree !== 'boolean') throw Error('Invalid worktree');
   return { ...input, requestId: input.requestId ?? randomUUID(),
-    ...(provider === 'claude' ? {permissionMode: input.permissionMode ?? 'plan',maxTurns: input.maxTurns ?? 50} : {}) };
+    ...(provider === 'claude' ? {permissionMode: input.permissionMode ?? 'plan',maxTurns: input.maxTurns ?? 50} : provider === 'opencode' ? {level: input.level ?? 'read-only',worktree: input.worktree ?? false} : {}) };
 }
 export class Coordinator {
   constructor({ store, runner, resolveProject = defaultResolve, maxActive = 4, maxQueued = 100, onFatal = error => { console.error('Storage failure:',error.message); process.exitCode=1; } }) {
