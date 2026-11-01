@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, existsSync, realpathSync, mkdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { Store, terminal } from '../src/store.js';
 import { Coordinator } from '../src/coordinator.js';
 import { createWorktree, worktreeStatus, removeWorktree } from '../src/worktrees.js';
@@ -22,14 +22,14 @@ function setup(t,{storeOptions={},...options}={}){
     try{
       if(args.prompt.includes('hold'))await new Promise(r=>gates.set(args.prompt,r));
       const file=/write:(\S+)/.exec(args.prompt)?.[1];
-      if(file)writeFileSync(join(args.cwd,file),'new\n');
+      if(file){mkdirSync(dirname(join(args.cwd,file)),{recursive:true});writeFileSync(join(args.cwd,file),'new\n');}
       if(args.prompt.includes('commit')){git(args.cwd,'add','-A');git(args.cwd,'commit','-qm','work');}
       return {status:'completed',result:'ok'};
     }finally{live.delete(args.prompt);}
   };
   const c=new Coordinator({store,runner,...options});
   t.after(async()=>{for(const r of gates.values())r();await c.shutdown();store.close();});
-  const done=async(id)=>{for(let i=0;i<500;i++){const v=c.status('opencode',id);if(terminal(v.status)&&!c.active.has(id))return v;await sleep(10);}throw Error('job did not finish');};
+  const done=async(id,provider='opencode')=>{for(let i=0;i<500;i++){const v=c.status(provider,id);if(terminal(v.status)&&!c.active.has(id))return v;await sleep(10);}throw Error('job did not finish');};
   const started=async(prompt)=>{for(let i=0;i<500&&!gates.has(prompt);i++)await sleep(10);assert.ok(gates.has(prompt),prompt+' never started');};
   const release=prompt=>gates.get(prompt)();
   return {c,store,directory,seen,live,done,started,release};
@@ -173,6 +173,62 @@ test('a clean finish never removes a worktree its delegate may still be writing 
   const view=await run(f,repo);
   assert.equal(existsSync(view.worktree.path),true);assert.equal(view.worktree.removed,false);
   await assert.rejects(()=>f.c.cleanup('opencode',{worktreeId:view.worktree.id,discard:true}),/still running/);
+});
+
+test('cleanup refuses a worktree an in-place job is running in, even with discard and before it writes',async t=>{
+  const repo=makeRepo(t),f=setup(t);
+  const base=await run(f,repo,{write:'a.js',prompt:'commit'}),{id:worktreeId,path}=base.worktree;
+  const job=await f.c.start('claude',{prompt:'hold',cwd:join(path,'sub')});await f.started('hold');
+  await assert.rejects(()=>f.c.cleanup('opencode',{worktreeId}),/still running/);
+  await assert.rejects(()=>f.c.cleanup('opencode',{worktreeId,discard:true}),/still running/);
+  assert.equal(existsSync(path),true);
+  f.release('hold');await f.done(job.id,'claude');
+  assert.equal((await f.c.cleanup('opencode',{worktreeId,discard:true})).removed,true);
+});
+
+test('a clean worktree is not auto-removed while an in-place job waits to run in it',async t=>{
+  const repo=makeRepo(t),f=setup(t);
+  const x=await f.c.start('opencode',{prompt:'hold-x',cwd:repo,worktree:true});await f.started('hold-x');
+  const y=await f.c.start('codex',{prompt:'hold-y',cwd:x.worktree.path});
+  await sleep(30);assert.equal(f.c.status('codex',y.id).status,'queued');
+  f.release('hold-x');const done=await f.done(x.id);
+  assert.equal(done.worktree.removed,false);assert.equal(existsSync(x.worktree.path),true);
+  await f.started('hold-y');assert.equal(f.seen.at(-1).cwd,x.worktree.path);
+  f.release('hold-y');await f.done(y.id,'codex');
+});
+
+test('ignored files a delegate writes count as changes; ignored files present at creation do not',async t=>{
+  const repo=makeRepo(t);
+  writeFileSync(join(repo,'.gitignore'),'out/\n*.log\n');git(repo,'add','.');git(repo,'commit','-qm','ignore');
+  // A checkout hook that generates an ignored file: that file is part of the fresh tree, not the delegate's work.
+  writeFileSync(join(repo,'.git','hooks','post-checkout'),'#!/bin/sh\necho gen > checkout.log\n',{mode:0o755});
+  const f=setup(t);
+  const clean=await run(f,repo);
+  assert.equal(clean.worktree.removed,true,JSON.stringify(clean.worktree));
+  const kept=await run(f,repo,{write:'out/report.txt'});
+  assert.equal(kept.worktree.removed,false);
+  assert.deepEqual(kept.worktree.changedFiles,['out/report.txt']);
+  await assert.rejects(()=>f.c.cleanup('opencode',{worktreeId:kept.worktree.id}),/discard/);
+  assert.equal(existsSync(join(kept.worktree.path,'out','report.txt')),true);
+});
+
+test('a rename reports both its old and new path',async t=>{
+  const repo=makeRepo(t),root=temp(t,'bridge-wt-root-');
+  const tree=await createWorktree({project:repo,jobId:'j2',root});
+  git(tree.path,'mv','README','RENAMED');
+  assert.deepEqual(worktreeStatus(tree.path),{dirty:true,changedFiles:['README','RENAMED']});
+});
+
+test('a failed creation keeps the row when its partial tree cannot be removed',async t=>{
+  const repo=makeRepo(t);
+  // The checkout hook breaks the new tree and fails, leaving a directory that is no longer a worktree.
+  writeFileSync(join(repo,'.git','hooks','post-checkout'),'#!/bin/sh\nrm -f .git\nexit 1\n',{mode:0o755});
+  const f=setup(t);
+  await assert.rejects(()=>f.c.start('opencode',{prompt:'x',cwd:repo,worktree:true}),/Could not create worktree/);
+  const rows=f.store.listWorktrees();
+  assert.equal(rows.length,1,'the partial tree stays discoverable');
+  assert.equal(existsSync(rows[0].path),true);
+  assert.equal(f.c.diagnostics().worktrees.count,1);
 });
 
 test('worktree records survive pruning of their job',async t=>{

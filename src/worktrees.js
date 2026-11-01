@@ -1,6 +1,6 @@
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
-import { existsSync, mkdirSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, realpathSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, basename, relative, isAbsolute } from 'node:path';
 import { stateDirectory } from './client.js';
 const exec = promisify(execFile);
@@ -13,11 +13,21 @@ export const defaultRoot = () => join(stateDirectory(), 'worktrees');
 export const inside = (parent, child) => { const r = relative(parent, child); return r === '' || (r !== '..' && !r.startsWith('../') && !isAbsolute(r)); };
 const branchOf = path => 'bridge/' + basename(path);
 const hasBranch = (cwd, branch) => { try { git(cwd, ['show-ref', '--verify', '--quiet', 'refs/heads/' + branch]); return true; } catch { return false; } };
-function porcelain(cwd) {
-  const out = git(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all']).split('\0'), files = [];
-  for (let i = 0; i < out.length; i++) { const e = out[i]; if (!e) continue; files.push(e.slice(3)); if (/[RC]/.test(e.slice(0, 2))) i++; }
-  return files;
+// -z puts a rename's original path in the entry after it; both sides are reported.
+function porcelain(cwd, { ignored = false } = {}) {
+  const out = git(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all', ...(ignored ? ['--ignored'] : [])]).split('\0'), files = [], skipped = [];
+  for (let i = 0; i < out.length; i++) {
+    const e = out[i]; if (!e) continue;
+    (e.startsWith('!!') ? skipped : files).push(e.slice(3));
+    if (/[RC]/.test(e.slice(0, 2)) && out[i + 1]) files.push(out[++i]);
+  }
+  return ignored ? { files, ignored: skipped } : files;
 }
+// Ignored files present right after checkout (hook output, say) are the tree's baseline; any other ignored file is the
+// delegate's work. The list lives in the worktree's private git dir, so it goes when the worktree does. A missing
+// baseline counts every ignored file as a change.
+const baselineOf = path => git(path, ['rev-parse', '--path-format=absolute', '--git-path', 'bridge-ignored']).trim();
+const readBaseline = path => { try { return new Set(readFileSync(baselineOf(path), 'utf8').split('\0').filter(Boolean)); } catch { return new Set(); } };
 // Commits reachable from revs and from no other branch, tag or remote: exactly what deleting the bridge branch would lose.
 function unique(cwd, revs, branch) {
   const out = git(cwd, ['log', '--format=%x00%H', '--name-only', ...revs, '--not', '--exclude=' + branch, '--branches', '--tags', '--remotes']);
@@ -39,10 +49,12 @@ export async function createWorktree({ project, jobId, root = defaultRoot() }) {
   const { path, branch } = planWorktree({ project, jobId, root });
   try { await exec('git', ['-C', project, 'worktree', 'add', '-q', '-b', branch, path, 'HEAD'], { ...limits, timeout: 300000 }); }
   catch (error) { throw Error('Could not create worktree: ' + reason(error)); }
+  writeFileSync(baselineOf(path), porcelain(path, { ignored: true }).ignored.join('\0'), { mode: 0o600 });
   return { path, branch };
 }
 export function worktreeStatus(path, { branch = branchOf(path) } = {}) {
-  const files = new Set(porcelain(path)), commits = unique(path, ['HEAD', ...(hasBranch(path, branch) ? ['refs/heads/' + branch] : [])], branch);
+  const status = porcelain(path, { ignored: true }), base = readBaseline(path);
+  const files = new Set([...status.files, ...status.ignored.filter(f => !base.has(f))]), commits = unique(path, ['HEAD', ...(hasBranch(path, branch) ? ['refs/heads/' + branch] : [])], branch);
   for (const f of commits.files) files.add(f);
   return { dirty: files.size > 0 || commits.count > 0, changedFiles: [...files].sort() };
 }

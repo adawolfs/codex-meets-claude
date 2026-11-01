@@ -91,8 +91,7 @@ export class Coordinator {
     this.store.putWorktree(row);this.creating.add(row.id);
     let inserted=false;
     try {
-      try{await createWorktree({project,jobId:id,root:this.worktreeRoot});}
-      catch(error){try{removeWorktree(row.path,{discard:true,branch:row.branch,repo:project});}catch{}this.store.deleteWorktree(row.id);throw error;}
+      await createWorktree({project,jobId:id,root:this.worktreeRoot});
       const {project:lock}=await this.resolveProject(row.path);
       const existing=admit();
       if(existing)return existing;
@@ -101,7 +100,7 @@ export class Coordinator {
       return view;
     } finally {
       this.creating.delete(row.id);
-      // Nothing owns a fresh tree that never got its job, so it is provably clean and safe to drop.
+      // Nothing owns a fresh tree that never got its job, so it is safe to drop; the row goes only once the tree has.
       if(!inserted&&this.store.getWorktree(row.id)){try{removeWorktree(row.path,{discard:true,branch:row.branch,repo:project});this.store.deleteWorktree(row.id);}catch{}}
     }
   }
@@ -162,7 +161,7 @@ export class Coordinator {
     try{
       const {dirty,changedFiles}=worktreeStatus(row.path,{branch:row.branch});report.changedFiles=changedFiles;
       const held=(openCode??this.store.record(record.id).view.openCode)?.interrupt==='unconfirmed';
-      if(dirty||held||status==='interrupted'||this.store.worktreeOwners(row.id).some(o=>o.id!==record.id))return report;
+      if(dirty||held||status==='interrupted'||this.store.worktreeOwners(row).some(o=>o.id!==record.id))return report;
       removeWorktree(row.path,{branch:row.branch,repo:row.project});this.store.deleteWorktree(row.id);report.removed=true;
     }catch(error){report.error=String(error.message||error).slice(0,1000);}
     return report;
@@ -171,7 +170,7 @@ export class Coordinator {
     if(provider!=='opencode')throw Error('cleanup is only supported for opencode');
     const row=this.store.getWorktree(worktreeId);
     if(!row)throw Error('worktree not found');
-    const owner=this.creating.has(row.id)?{id:row.job}:this.store.worktreeOwners(row.id)[0];
+    const owner=this.creating.has(row.id)?{id:row.job}:this.store.worktreeOwners(row)[0];
     if(owner)throw Error(`Worktree ${row.id} is in use: job ${owner.id} is still running, queued, or holds an OpenCode session not proven stopped; wait for it, or cancel it first`);
     removeWorktree(row.path,{discard,branch:row.branch,repo:row.project});
     this.store.deleteWorktree(row.id);

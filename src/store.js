@@ -139,9 +139,10 @@ export class Store {
   listWorktrees() { return this.db.prepare('SELECT * FROM worktrees ORDER BY created,id').all().map(r => ({ ...r })); }
   getWorktree(id) { const r = this.db.prepare('SELECT * FROM worktrees WHERE id=?').get(id); return r ? { ...r } : null; }
   deleteWorktree(id) { this.db.prepare('DELETE FROM worktrees WHERE id=?').run(id); }
-  // Jobs that may still use a worktree: queued or running, or an opencode job whose delegate was never proven stopped.
-  worktreeOwners(id) {
-    return this.db.prepare(`SELECT id,status FROM jobs WHERE json_extract(view,'$.worktree.id')=? AND (status IN ('queued','running') OR (provider='opencode' AND ${UNCONFIRMED}))`).all(id).map(r => ({ ...r }));
+  // Jobs that may still use a worktree: those that reference it, and in-place jobs of any provider whose lock identity is
+  // its toplevel (cwd inside it), while queued or running, or opencode ones whose delegate was never proven stopped.
+  worktreeOwners({ id, path }) {
+    return this.db.prepare(`SELECT id,status FROM jobs WHERE (json_extract(view,'$.worktree.id')=? OR project=?) AND (status IN ('queued','running') OR (provider='opencode' AND ${UNCONFIRMED}))`).all(id, path).map(r => ({ ...r }));
   }
   prune() {
     const cutoff = new Date(Date.now()-this.maxAgeMs).toISOString();
