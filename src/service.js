@@ -45,7 +45,7 @@ export async function startService({directory=stateDirectory(),runner=createRunn
     let value;
     if(action==='start')value=await coordinator.start(provider,args);
     else if(action==='status')value=coordinator.status(provider,args.jobId);
-    else if(action==='cancel')value=await coordinator.cancel(provider,args.jobId);
+    else if(action==='cancel')value=await coordinator.cancel(provider,args.jobId,{force:args.force});
     else if(action==='list_jobs')value=coordinator.list(provider,args);
     else if(action==='events')value=coordinator.events(provider,args.jobId,{after:args.after,limit:args.limit});
     else value={...coordinator.diagnostics(),storage:directory,executables:{claude:executable(process.env.CLAUDE_COMMAND),codex:executable(process.env.CODEX_COMMAND)}};

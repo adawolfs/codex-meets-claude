@@ -5,7 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { Store } from '../src/store.js';
+import { createServer } from 'node:http';
+import { OpenCode } from '@opencode/client';
 import { Coordinator, openCodeAborter } from '../src/coordinator.js';
+import { validateCall } from '../src/persistent-tools.js';
 const tick=()=>new Promise(r=>setImmediate(r));
 const args=(requestId,cwd='/p')=>({prompt:'go',cwd,requestId});
 const identity={sessionId:'s1',endpoint:'http://x'};
@@ -206,4 +209,102 @@ test('the real aborter treats an unreachable, relocated, failing or hung service
   assert.equal(await openCodeAborter({service:{...fakeService(),discover:async()=>{throw Error('x');}},connect:probe().connect})(target),false);
   assert.equal(await openCodeAborter({service:fakeService(),connect:probe(async()=>{throw Error('x');}).connect})(target),false);
   assert.equal(await openCodeAborter({service:fakeService(),connect:probe(()=>new Promise(()=>{})).connect,timeoutMs:20})(target),false);
+});
+
+const notFound=(sessionID='s1')=>({_tag:'SessionNotFoundError',sessionID,message:'Session not found'});
+const target={provider:'opencode',sessionId:'s1',endpoint:'http://x'};
+test('a reachable service that does not know the session proves it stopped; nothing else does',async t=>{
+  const aborter=error=>openCodeAborter({service:fakeService(),connect:probe(async()=>{throw error;}).connect})(target);
+  assert.equal(await aborter(notFound('s1')),true);
+  assert.equal(await aborter(notFound('other')),false);
+  assert.equal(await aborter({_tag:'SessionNotFoundError'}),false);
+  assert.equal(await aborter({_tag:'UnauthorizedError',message:'no'}),false);
+  assert.equal(await aborter({_tag:'LocationNotFoundError',message:'no'}),false);
+  assert.equal(await aborter(Object.assign(Error('fetch failed'),{name:'ClientError',reason:'Transport'})),false);
+  assert.equal(await aborter(Error('Session not found')),false);
+  assert.equal(await aborter(null),false);
+});
+async function serve(t,status,body){
+  const server=createServer((req,res)=>{res.writeHead(status,{'content-type':'application/json'});res.end(JSON.stringify(body));});
+  await new Promise(r=>server.listen(0,'127.0.0.1',r));t.after(()=>server.close());
+  return 'http://127.0.0.1:'+server.address().port;
+}
+test('identification holds against the real client over HTTP',async t=>{
+  const check=async(status,body,sessionId='s1')=>{const url=await serve(t,status,body);
+    return openCodeAborter({service:{discover:async()=>({url}),headers:()=>undefined},connect:o=>OpenCode.make(o)})({provider:'opencode',sessionId,endpoint:url});};
+  assert.equal(await check(200,{interrupted:true}),true);
+  assert.equal(await check(404,notFound('s1')),true);
+  assert.equal(await check(404,notFound('s1'),'s2'),false);
+  assert.equal(await check(404,{_tag:'LocationNotFoundError',message:'x'}),false);
+  assert.equal(await check(404,{}),false);
+  assert.equal(await check(500,{message:'boom'}),false);
+  assert.equal(await check(401,{_tag:'UnauthorizedError',message:'no'}),false);
+  const closed=await serve(t,200,{});
+  const gone=createServer();await new Promise(r=>gone.listen(0,'127.0.0.1',r));const url='http://127.0.0.1:'+gone.address().port;await new Promise(r=>gone.close(r));
+  assert.equal(await openCodeAborter({service:{discover:async()=>({url}),headers:()=>undefined},connect:o=>OpenCode.make(o)})({provider:'opencode',sessionId:'s1',endpoint:url}),false);
+});
+test('cancel releases a hold when the live service reports the session unknown, and records confirmed',async t=>{
+  const abortSession=openCodeAborter({service:fakeService(),connect:probe(async()=>{throw notFound('s1');}).connect});
+  const {c,store,started}=await coordinator(t,s=>{unconfirmedDone(s);s.insert('claude',args('queued'),'/p');},{abortSession});
+  const id=store.unrecovered()[0].id;
+  assert.equal((await c.cancel('opencode',id)).openCode.interrupt,'confirmed');
+  for(let i=0;i<5;i++)await tick();
+  assert.deepEqual(started,['go']);assert.equal(c.diagnostics().unrecovered,0);
+});
+test('startup recovery also releases an orphan whose session the service has forgotten',async t=>{
+  const abortSession=openCodeAborter({service:fakeService(),connect:probe(async()=>{throw notFound('s1');}).connect});
+  const {c,store}=await coordinator(t,s=>{orphan(s);},{abortSession});await tick();
+  assert.equal(store.counts().interrupted,1);assert.equal(c.diagnostics().unrecovered,0);
+});
+test('a transport failure against a reachable service does not release the hold',async t=>{
+  const abortSession=openCodeAborter({service:fakeService(),connect:probe(async()=>{throw Object.assign(Error('fetch failed'),{reason:'Transport'});}).connect});
+  const {c,store,started}=await coordinator(t,s=>{unconfirmedDone(s);s.insert('claude',args('queued'),'/p');},{abortSession});
+  await assert.rejects(c.cancel('opencode',store.unrecovered()[0].id),/force/);
+  for(let i=0;i<5;i++)await tick();
+  assert.deepEqual(started,[]);assert.equal(c.diagnostics().unrecovered,1);
+});
+test('force releases a running orphan and a finished unconfirmed row without any abort, recorded as forced',async t=>{
+  const calls=[];
+  const {c,store,started}=await coordinator(t,s=>{orphan(s,'opencode','/p');unconfirmedDone(s,'/q');s.insert('claude',args('qp'),'/p');s.insert('opencode',{...args('qs','/z'),sessionId:'s1'},'/z');s.insert('claude',args('qq'),'/q');},{abortSession:async s=>(calls.push(s),false)});
+  for(let i=0;i<3;i++)await tick();
+  assert.deepEqual(started,[]);calls.length=0;
+  const [running,done]=['running','cancelled'].map(st=>store.db.prepare('SELECT id FROM jobs WHERE status=?').get(st).id);
+  const a=await c.cancel('opencode',running,{force:true}),b=await c.cancel('opencode',done,{force:true});
+  assert.equal(a.status,'interrupted');assert.equal(a.openCode.interrupt,'forced');
+  assert.equal(b.status,'cancelled');assert.equal(b.openCode.interrupt,'forced');
+  assert.deepEqual(store.get('opencode',running).openCode,{...identity,interrupt:'forced'});
+  for(let i=0;i<5;i++)await tick();
+  assert.deepEqual(started.sort(),['go','go','go']);
+  assert.equal(c.diagnostics().unrecovered,0);assert.equal(calls.length,0);
+});
+test('a forced row no longer holds its project or its session',async t=>{
+  const {c,store,started}=await coordinator(t,s=>{unconfirmedDone(s);},{abortSession:async()=>false});
+  const id=store.unrecovered()[0].id;
+  await c.cancel('opencode',id,{force:true});
+  await c.start('claude',{prompt:'project',cwd:'/p'});await c.start('opencode',{prompt:'session',cwd:'/q',sessionId:'s1'});
+  for(let i=0;i<5;i++)await tick();
+  assert.deepEqual(started.sort(),['project','session']);
+});
+test('force on a row that holds nothing is an ordinary cancel',async t=>{
+  const {c}=await coordinator(t,()=>{});
+  const q=await c.start('opencode',{prompt:'q',cwd:'/p'});await c.cancel('opencode',q.id,{force:true});
+});
+test('force is opencode-only and must be boolean',async t=>{
+  const {c,store}=await coordinator(t,()=>{});
+  const job=store.insert('claude',args('c'),'/p');
+  for(const p of ['claude','codex']){
+    assert.throws(()=>c.cancel(p,job.id,{force:true}),/only supported for opencode/);
+    assert.throws(()=>validateCall(p,'cancel',{jobId:'x',force:true}),/Unknown argument: force/);
+  }
+  assert.equal(validateCall('opencode','cancel',{jobId:'x',force:true}).name,'opencode_cancel');
+  assert.throws(()=>validateCall('opencode','cancel',{jobId:'x',force:'yes'}),/Invalid force/);
+  assert.equal(c.cancel('claude',job.id).status,'cancelled');
+});
+test('an unconfirmed row with no session identity can be released only by force',async t=>{
+  const {c,store,started}=await coordinator(t,s=>{const id=orphan(s,'opencode','/p',{sessionId:null,endpoint:null,interrupt:'unconfirmed'});s.update(id,{status:'failed',finishedAt:new Date().toISOString()});s.insert('claude',args('queued'),'/p');},{abortSession:async()=>true});
+  const id=store.unrecovered()[0].id;
+  await assert.rejects(c.cancel('opencode',id),/force/);
+  assert.equal((await c.cancel('opencode',id,{force:true})).openCode.interrupt,'forced');
+  for(let i=0;i<5;i++)await tick();
+  assert.deepEqual(started,['go']);
 });

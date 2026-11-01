@@ -9,7 +9,7 @@ export function toolsFor(provider){
  const definitions=[
  ['start','Queue a durable task. Reuse requestId to retry safely. parentJobId explicitly resumes a finished session; inspect interrupted work before resuming.',schema(start,['prompt','cwd'])],
  ['status','Get durable task status. queued/running are active; interrupted requires explicit recovery.',schema({jobId:str},['jobId'])],
- ['cancel','Cancel queued work or request active cancellation; finishedAt confirms cleanup.',schema({jobId:str},['jobId'])],
+ ['cancel',provider==='opencode'?'Cancel queued work or request active cancellation; finishedAt confirms cleanup. On a job whose OpenCode session could not be confirmed stopped, retries the interrupt; force:true releases its project and session without proof (the delegate may still be editing).':'Cancel queued work or request active cancellation; finishedAt confirms cleanup.',schema({jobId:str,...(provider==='opencode'?{force:{type:'boolean'}}:{})},['jobId'])],
  ['list_jobs','Page through durable job summaries. Use status for full results.',schema({after:cursor,limit})],
  ['diagnostics','Show service readiness, queue limits and executable availability without model inference.',schema({})],
  ];

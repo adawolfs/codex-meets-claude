@@ -119,8 +119,9 @@ export class Store {
     return this.db.prepare(`SELECT id,provider,project,oc_session AS sessionId FROM jobs WHERE status='running' OR (provider='opencode' AND ${UNCONFIRMED})`).all().filter(r => !live.has(r.id));
   }
   // A confirmed abort releases a hold: a running row becomes interrupted, a finished one just stops being unconfirmed.
-  confirm(id) {
-    const { view } = this.record(id), openCode = { ...view.openCode, interrupt: 'confirmed' };
+  // 'forced' is an operator's release without proof; it is recorded apart from 'confirmed' so it is never read as one.
+  confirm(id, how = 'confirmed') {
+    const { view } = this.record(id), openCode = { ...view.openCode, interrupt: how };
     return view.status === 'running' ? this.update(id,{status:'interrupted',finishedAt:new Date().toISOString(),error:INTERRUPTED,progress:{phase:'interrupted',text:''},openCode}) : this.update(id,{openCode});
   }
   // The shared OpenCode service outlives this process, so its rows are released only once the abort is confirmed.

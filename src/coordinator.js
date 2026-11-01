@@ -1,12 +1,14 @@
 import { randomUUID } from 'node:crypto';
-import { OpenCode } from '@opencode/client';
+import { OpenCode, isSessionNotFoundError } from '@opencode/client';
 import { Service } from '@opencode/client/service';
 import { resolveProject as defaultResolve } from './paths.js';
 import { pageArgs } from './store.js';
 import { PROVIDERS, LEVELS } from './persistent-tools.js';
 const timestamp = () => new Date().toISOString();
 const bare = url => { const u = new URL(url); u.username = u.password = u.search = u.hash = ''; return u.href.replace(/\/$/, ''); };
-// True only when the recorded service answered an interrupt. It never starts a service: an absent one has proven nothing.
+// True only on proof the delegate is stopped: the recorded service accepted the interrupt, or answered that it has no such
+// session (the client's typed SessionNotFoundError for this very id). Anything else, transport failures included, is not
+// proof. It never starts a service, and an unregistered one proves nothing: `opencode serve` may run elsewhere.
 export const openCodeAborter = ({ service = Service, connect = o => OpenCode.make(o), timeoutMs = 5000 } = {}) => async ({ sessionId, endpoint }) => {
   let timer;
   try {
@@ -14,7 +16,7 @@ export const openCodeAborter = ({ service = Service, connect = o => OpenCode.mak
     // The recorded endpoint carries no credentials; a service elsewhere is a different instance.
     if (!live || bare(live.url) !== bare(endpoint)) return false;
     const client = connect({ baseUrl: live.url, headers: service.headers(live) });
-    return await Promise.race([(async () => client.session.interrupt({ sessionID: sessionId }))().then(() => true), new Promise(r => { timer = setTimeout(r, timeoutMs, false); })]);
+    return await Promise.race([(async () => client.session.interrupt({ sessionID: sessionId }))().then(() => true, e => isSessionNotFoundError(e) && e.sessionID === sessionId), new Promise(r => { timer = setTimeout(r, timeoutMs, false); })]);
   } catch { return false; } finally { clearTimeout(timer); }
 };
 export function validateStart(provider, input) {
@@ -111,20 +113,22 @@ export class Coordinator {
   status(provider,id){return this.store.get(provider,id);}
   list(provider,args){pageArgs(args);return this.store.list(provider,args);}
   events(provider,id,args){return this.store.events(provider,id,args);}
-  cancel(provider,id){
+  cancel(provider,id,{force=false}={}){
+    if(force&&provider!=='opencode')throw Error('force is only supported for opencode');
     const job=this.store.get(provider,id);
     if(job.status==='queued'){const result=this.store.update(id,{status:'cancelled',finishedAt:timestamp(),progress:{phase:'cancelled',text:''}});this.store.prune();return result;}
-    if(this.holds().some(r=>r.id===id))return this.release(job);
+    if(this.holds().some(r=>r.id===id))return this.release(job,force);
     const record=this.active.get(id);
     if(record){record.cancelled=true;this.store.update(id,{cancelRequested:true});record.controller.abort();}
     return this.store.get(provider,id);
   }
   // Cancelling a held row retries its abort; only a confirmed one releases the project and session.
-  async release(job){
+  async release(job,force){
+    if(force){this.store.confirm(job.id,'forced');queueMicrotask(()=>this.pump());return this.store.get(job.provider,job.id);}
     const {sessionId,endpoint}=job.openCode??{};
     let ok=false;
     try{ok=sessionId&&endpoint&&(await this.abortSession({provider:job.provider,sessionId,endpoint}))===true;}catch{}
-    if(!ok)throw Error(`Could not confirm that OpenCode session ${sessionId} stopped, so its project stays locked; retry cancel once the OpenCode service is reachable.`);
+    if(!ok)throw Error(`Could not confirm that OpenCode session ${sessionId} stopped, so its project stays locked; retry cancel once the OpenCode service is reachable, or cancel with force:true to release it without proof (the delegate may still be editing).`);
     this.store.confirm(job.id);queueMicrotask(()=>this.pump());
     return this.store.get(job.provider,job.id);
   }
