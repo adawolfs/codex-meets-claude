@@ -24,7 +24,7 @@ const stable = value => JSON.stringify(value, Object.keys(value).sort());
 export class Store {
   constructor({ directory, maxHistory = 1000, maxAgeMs = 30 * 86400000, maxEvents = 256 }) {
     for (const n of [maxHistory, maxAgeMs, maxEvents]) if (!Number.isSafeInteger(n) || n < 1) throw Error('Invalid storage limit');
-    this.maxHistory = maxHistory; this.maxAgeMs = maxAgeMs; this.maxEvents = maxEvents;
+    this.maxHistory = maxHistory; this.maxAgeMs = maxAgeMs; this.maxEvents = maxEvents; this.directory = directory;
     mkdirSync(directory, { recursive: true, mode: 0o700 }); chmodSync(directory, 0o700);
     this.db = new DatabaseSync(join(directory, 'jobs.sqlite'));
     chmodSync(join(directory, 'jobs.sqlite'), 0o600);
@@ -41,13 +41,13 @@ export class Store {
     return JSON.parse(row.view);
   }
   fingerprint(args) { return createHash('sha256').update(stable(args)).digest('hex'); }
-  insert(provider, args, project, original = args) {
+  insert(provider, args, project, original = args, { id = randomUUID(), worktree } = {}) {
     const prior = this.findRequest(provider, original);
     if (prior) return prior;
-    const view = { id: randomUUID(), provider, backend: BACKENDS[provider],
+    const view = { id, provider, backend: BACKENDS[provider],
       status: 'queued', queuedAt: new Date().toISOString(), startedAt: null, cwd: args.cwd,
       sessionId: args.sessionId ?? null, parentJobId: args.parentJobId ?? null,
-      requestId: args.requestId, result: null, error: null, progress: { phase: 'queued', text: '' } };
+      requestId: args.requestId, result: null, error: null, progress: { phase: 'queued', text: '' }, ...(worktree ? { worktree } : {}) };
     this.db.prepare('INSERT INTO jobs(id,provider,request_id,fingerprint,args,project,status,view) VALUES(?,?,?,?,?,?,?,?)')
       .run(view.id, provider, args.requestId, this.fingerprint(original), JSON.stringify(args), project, view.status, JSON.stringify(view));
     return view;
@@ -65,7 +65,7 @@ export class Store {
   update(id, patch) {
     const row = this.record(id);
     // Never replace public identity or original directory with backend-local IDs.
-    const allowed = ['status','startedAt','finishedAt','sessionId','result','error','progress','permissionDenials','usage','costUsd','cancelRequested','openCode'];
+    const allowed = ['status','startedAt','finishedAt','sessionId','result','error','progress','permissionDenials','usage','costUsd','cancelRequested','openCode','worktree'];
     const next = { ...row.view };
     for (const key of allowed) if (Object.hasOwn(patch, key)) next[key] = patch[key];
     const body = JSON.stringify(next);
@@ -134,6 +134,14 @@ export class Store {
     this.db.exec('BEGIN');
     try { for (const id of free) interrupt(id); this.db.exec('COMMIT'); }
     catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+  putWorktree(r) { this.db.prepare('INSERT INTO worktrees(id,job,project,branch,path,created) VALUES(?,?,?,?,?,?)').run(r.id, r.job, r.project, r.branch, r.path, r.created); return r; }
+  listWorktrees() { return this.db.prepare('SELECT * FROM worktrees ORDER BY created,id').all().map(r => ({ ...r })); }
+  getWorktree(id) { const r = this.db.prepare('SELECT * FROM worktrees WHERE id=?').get(id); return r ? { ...r } : null; }
+  deleteWorktree(id) { this.db.prepare('DELETE FROM worktrees WHERE id=?').run(id); }
+  // Jobs that may still use a worktree: queued or running, or an opencode job whose delegate was never proven stopped.
+  worktreeOwners(id) {
+    return this.db.prepare(`SELECT id,status FROM jobs WHERE json_extract(view,'$.worktree.id')=? AND (status IN ('queued','running') OR (provider='opencode' AND ${UNCONFIRMED}))`).all(id).map(r => ({ ...r }));
   }
   prune() {
     const cutoff = new Date(Date.now()-this.maxAgeMs).toISOString();

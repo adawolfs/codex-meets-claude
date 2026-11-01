@@ -14,7 +14,7 @@ export function toolsFor(provider){
  ['diagnostics','Show service readiness, queue limits and executable availability without model inference.',schema({})],
  ];
  if(provider!=='codex')definitions.push(['events','Page bounded text/tool/session events. truncated means older history was evicted.',schema({jobId:str,after:cursor,limit},['jobId'])]);
- if(provider==='opencode')definitions.push(['cleanup','Remove the isolated worktree of a finished task.',schema({},[])]);
+ if(provider==='opencode')definitions.push(['cleanup','Remove a task worktree and its bridge/<jobId> branch, by the worktreeId from the job view or diagnostics. Refuses while a job still uses it; refuses one with changes or commits unless discard:true. Nothing is ever merged.',schema({worktreeId:str,discard:{type:'boolean'}},['worktreeId'])]);
  return definitions.map(([action,description,inputSchema])=>({name:provider+'_'+action,description,inputSchema}));
 }
 export function validateCall(provider,action,args){
