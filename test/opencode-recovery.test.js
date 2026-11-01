@@ -15,7 +15,7 @@ const identity={sessionId:'s1',endpoint:'http://x'};
 function fixture(t){const directory=mkdtempSync(join(tmpdir(),'bridge-recover-'));let s=new Store({directory});t.after(()=>{s.close();rmSync(directory,{recursive:true,force:true});});return {directory,get store(){return s;},reopen(){s.close();s=new Store({directory});return s;}};}
 function orphan(store,provider='opencode',project='/p',openCode=identity,requestId='o-'+provider){
   const job=store.insert(provider,args(requestId,project),project);
-  store.update(job.id,{status:'running',startedAt:new Date().toISOString(),...(openCode?{openCode}:{})});
+  store.update(job.id,{status:'running',startedAt:new Date().toISOString(),...(openCode?{openCode,sessionId:openCode.sessionId}:{})});
   return job.id;
 }
 const V1="BEGIN; CREATE TABLE jobs (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, provider TEXT NOT NULL, request_id TEXT NOT NULL, fingerprint TEXT NOT NULL, args TEXT NOT NULL, project TEXT NOT NULL, status TEXT NOT NULL, view TEXT NOT NULL, finished TEXT, UNIQUE(provider,request_id)); CREATE TABLE events (job TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, seq INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(job,seq)); CREATE INDEX jobs_status ON jobs(status,seq); PRAGMA user_version=1; COMMIT;";
@@ -141,8 +141,10 @@ function unconfirmedDone(store,project='/p',openCode=identity,requestId='d-'+pro
   store.update(id,{status:'cancelled',finishedAt:new Date().toISOString()});return id;
 }
 test('an unconfirmed orphan holds its session as well as its project',async t=>{
-  const {c,started}=await coordinator(t,s=>{orphan(s);},{abortSession:async()=>false});
-  const same=await c.start('opencode',{prompt:'same-session',cwd:'/q',sessionId:'s1'});
+  // A job queued for the session before the hold (start itself now refuses a bare resume of a session still running).
+  const {c,store,started}=await coordinator(t,s=>{orphan(s);s.insert('opencode',{...args('same-session','/q'),sessionId:'s1'},'/q');},{abortSession:async()=>false});
+  const same=store.queued().find(j=>j.provider==='opencode');
+  await assert.rejects(c.start('opencode',{prompt:'again',cwd:'/p',sessionId:'s1'}),/must be finished/);
   const other=await c.start('opencode',{prompt:'other-session',cwd:'/q',sessionId:'s2'});
   const resumed=await c.start('claude',{prompt:'claude-same-id',cwd:'/r',sessionId:'s1'});
   for(let i=0;i<5;i++)await tick();
@@ -151,8 +153,10 @@ test('an unconfirmed orphan holds its session as well as its project',async t=>{
   assert.equal(c.status('opencode',other.id).status,'completed');assert.equal(c.status('claude',resumed.id).status,'completed');
 });
 test('a finished job whose interrupt was unconfirmed still holds its project and session, and survives prune',async t=>{
-  const {c,store,started}=await coordinator(t,s=>{unconfirmedDone(s);},{abortSession:async()=>false});
-  await c.start('claude',{prompt:'project',cwd:'/p'});await c.start('opencode',{prompt:'session',cwd:'/q',sessionId:'s1'});await c.start('claude',{prompt:'free',cwd:'/r'});
+  const {c,store,started}=await coordinator(t,s=>{unconfirmedDone(s);s.insert('opencode',{...args('session','/q'),sessionId:'s1'},'/q');},{abortSession:async()=>false});
+  // The session lives in /p, so a bare resume elsewhere is refused outright; the row queued at /q waits on the hold.
+  await assert.rejects(c.start('opencode',{prompt:'x',cwd:'/q',sessionId:'s1'}),/resume must use that cwd/);
+  await c.start('claude',{prompt:'project',cwd:'/p'});await c.start('claude',{prompt:'free',cwd:'/r'});
   for(let i=0;i<5;i++)await tick();
   assert.deepEqual(started,['free']);assert.equal(c.diagnostics().unrecovered,1);
   store.maxHistory=1;for(let i=0;i<3;i++){const j=store.insert('claude',args('f'+i,'/z'),'/z');store.update(j.id,{status:'completed',finishedAt:new Date().toISOString()});}
@@ -283,7 +287,7 @@ test('a forced row no longer holds its project or its session',async t=>{
   const {c,store,started}=await coordinator(t,s=>{unconfirmedDone(s);},{abortSession:async()=>false});
   const id=store.unrecovered()[0].id;
   await c.cancel('opencode',id,{force:true});
-  await c.start('claude',{prompt:'project',cwd:'/p'});await c.start('opencode',{prompt:'session',cwd:'/q',sessionId:'s1'});
+  await c.start('claude',{prompt:'project',cwd:'/r'});await c.start('opencode',{prompt:'session',cwd:'/p',sessionId:'s1'});
   for(let i=0;i<5;i++)await tick();
   assert.deepEqual(started.sort(),['project','session']);
 });

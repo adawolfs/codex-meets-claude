@@ -18,7 +18,7 @@ function setup(t,{storeOptions={},...options}={}){
   const directory=temp(t,'bridge-wt-state-'),store=new Store({directory,...storeOptions}),seen=[],gates=new Map(),live=new Set();
   const runner=async(provider,args,update)=>{
     seen.push(args);live.add(args.prompt);
-    update({sessionId:args.sessionId||'s-'+args.prompt},[]);
+    const sessionId=args.sessionId||'s-'+args.prompt;update({sessionId,...(provider==='opencode'?{openCode:{sessionId,endpoint:'http://x',interrupt:null}}:{})},[]);
     try{
       if(args.prompt.includes('hold'))await new Promise(r=>gates.set(args.prompt,r));
       const file=/write:(\S+)/.exec(args.prompt)?.[1];
@@ -302,6 +302,29 @@ test('resume re-enters the parent worktree, and is rejected once it is gone',asy
   assert.equal(finished.worktree.path,parent.worktree.path);
   removeWorktree(parent.worktree.path,{discard:true});
   await assert.rejects(()=>f.c.start('opencode',{prompt:'more',cwd:repo,parentJobId:parent.id}),/worktree/);
+});
+
+test('a bare sessionId resume follows the job that ran the session: its worktree, its lock and its cwd',async t=>{
+  const repo=makeRepo(t),other=makeRepo(t),f=setup(t);
+  const parent=await run(f,repo,{write:'a.js',sessionId:'S1'}),session=parent.sessionId,{id:worktreeId,path}=parent.worktree;
+  await assert.rejects(()=>f.c.start('opencode',{prompt:'x',cwd:other,sessionId:session}),e=>e.message.includes(parent.id)&&/resume must use that cwd/.test(e.message));
+  const child=await f.c.start('opencode',{prompt:'hold',cwd:repo,sessionId:session});
+  assert.equal(child.worktree.id,worktreeId);
+  await f.started('hold');
+  assert.equal(f.seen.at(-1).cwd,path);assert.equal(f.seen.at(-1).sessionId,session);
+  // The tree has an owner, so it cannot be force-removed under the delegate; an in-place job in the source still runs.
+  await assert.rejects(()=>f.c.cleanup('opencode',{worktreeId,discard:true}),/still running/);
+  const inPlace=await f.c.start('opencode',{prompt:'hold-src',cwd:repo});await f.started('hold-src');
+  // While it runs, a further bare resume of that session is refused rather than queued against an unknown tree.
+  await assert.rejects(()=>f.c.start('opencode',{prompt:'again',cwd:repo,sessionId:session}),/must be finished/);
+  f.release('hold');f.release('hold-src');await f.done(child.id);await f.done(inPlace.id);
+  assert.equal(existsSync(path),true);
+  // An in-place session resumed bare keeps the in-place rules; an unknown session is left to the adapter's checks.
+  const flat=await run(f,other,{worktree:false,prompt:'flat',sessionId:'F1'});
+  await assert.rejects(()=>f.c.start('opencode',{prompt:'x',cwd:other,sessionId:flat.sessionId,worktree:true}),/new worktree/);
+  const resumed=await run(f,other,{worktree:false,sessionId:flat.sessionId,prompt:'more'});
+  assert.equal(resumed.status,'completed');assert.equal(resumed.worktree,undefined);
+  assert.equal((await run(f,other,{worktree:false,sessionId:'never-seen'})).status,'completed');
 });
 
 test('a queued resume whose worktree vanishes fails instead of running elsewhere',async t=>{

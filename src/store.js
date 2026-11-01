@@ -62,6 +62,10 @@ export class Store {
     if (!row) throw Error('job not found');
     return JSON.parse(row.view);
   }
+  lastOfSession(provider, sessionId) {
+    const row = this.db.prepare('SELECT view FROM jobs WHERE provider=? AND oc_session=? ORDER BY seq DESC LIMIT 1').get(provider, sessionId);
+    return row ? JSON.parse(row.view) : null;
+  }
   update(id, patch) {
     const row = this.record(id);
     // Never replace public identity or original directory with backend-local IDs.

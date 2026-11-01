@@ -62,10 +62,13 @@ export class Coordinator {
     const {cwd,project}=await this.resolveProject(args.cwd);args.cwd=cwd;
     if(this.closing)throw Error('Service is shutting down');
     let lock=project,worktree;
-    if(args.parentJobId){
-      const parent=this.store.get(provider,args.parentJobId);
-      if(['queued','running'].includes(parent.status)||!parent.sessionId)throw Error('Parent must be finished and have a sessionId');
-      if(parent.cwd!==cwd)throw Error('Resume must use the original cwd');
+    // An OpenCode session works where it was created, so a bare sessionId resume follows the job that last ran it: the
+    // same cwd, and its worktree, locked and owned like a parentJobId resume.
+    const parent=args.parentJobId?this.store.get(provider,args.parentJobId):provider==='opencode'&&args.sessionId?this.store.lastOfSession(provider,args.sessionId):null;
+    if(parent){
+      const named=args.parentJobId?'Parent':`Session ${args.sessionId} was last run by job ${parent.id}, so resume follows it. That job`;
+      if(['queued','running'].includes(parent.status)||!parent.sessionId)throw Error(named+' must be finished and have a sessionId');
+      if(parent.cwd!==cwd)throw Error(args.parentJobId?'Resume must use the original cwd':`${named} ran in ${parent.cwd}; resume must use that cwd`);
       if(args.sessionId && args.sessionId!==parent.sessionId)throw Error('sessionId does not match parent');
       args.sessionId=parent.sessionId;
       // The worktree comes from its table, never from cwd: a worktree job's stored cwd is the source checkout.
