@@ -1,1 +1,1 @@
-{"name":"agent-bridge-local","owner":{"name":"Local"},"plugins":[{"name":"agent-bridge","source":"./plugin","description":"Codex and Claude interoperability"}]}
+{"name":"agent-bridge-local","owner":{"name":"Local"},"plugins":[{"name":"agent-bridge","source":"./plugin","description":"Claude, Codex and OpenCode interoperability","version":"0.4.0"}]}

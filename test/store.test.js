@@ -14,12 +14,12 @@ test('durable IDs and idempotency survive reopening; providers cannot read each 
  assert.equal(f.reopen().get('claude',j.id).id,j.id);
  assert.equal(f.store.insert('claude',request,'/project').id,j.id);
 });
-test('recovery interrupts running jobs but preserves queued jobs and completed results',t=>{
+test('recovery interrupts running jobs but preserves queued jobs and completed results',async t=>{
  const f=fixture(t),s=f.store;
  const a=s.insert('claude',request,'/project'),b=s.insert('codex',{...request,requestId:'two'},'/other');
  s.update(a.id,{status:'running',sessionId:'session-1'});
  const c=s.insert('claude',{...request,requestId:'three'},'/third');s.update(c.id,{status:'completed',result:'answer',finishedAt:new Date().toISOString()});
- const next=f.reopen();next.recover();
+ const next=f.reopen();await next.recover();
  assert.equal(next.get('claude',a.id).status,'interrupted');assert.equal(next.get('claude',a.id).sessionId,'session-1');
  assert.equal(next.get('codex',b.id).status,'queued');assert.equal(next.get('claude',c.id).result,'answer');
 });

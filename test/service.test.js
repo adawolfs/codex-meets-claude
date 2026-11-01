@@ -14,7 +14,7 @@ test('two MCP facades share durable jobs; disconnect never cancels; service rest
  let service=await startService({directory,runner,resolveProject:async cwd=>({cwd,project:cwd})});
  t.after(async()=>{finish?.();await service.close();rmSync(directory,{recursive:true,force:true});});
  await assert.rejects(startService({directory,runner}),/already running/);
- const connect=async()=>{const client=new Client({name:'test',version:'1'});await client.connect(new StdioClientTransport({command:process.execPath,args:[resolve('src/mcp-client.js')],env:{...process.env,BRIDGE_STATE_DIR:directory,BRIDGE_PROVIDER:'claude'},stderr:'pipe'}));return client;};
+ const connect=async()=>{const client=new Client({name:'test',version:'1'});await client.connect(new StdioClientTransport({command:process.execPath,args:[resolve('src/mcp-client.js')],env:{...process.env,BRIDGE_STATE_DIR:directory,BRIDGE_CLIENT:'codex'},stderr:'pipe'}));return client;};
  const one=await connect(),two=await connect();t.after(()=>two.close());
  const call=async(c,name,args)=>{const r=await c.callTool({name,arguments:args});assert.ok(!r.isError,r.content[0].text);return JSON.parse(r.content[0].text);};
  const job=await call(one,'claude_start',{prompt:'hello',cwd:'/tmp',requestId:'test-retry'});

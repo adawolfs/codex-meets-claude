@@ -12,7 +12,7 @@ export function createRunner({ timeoutMs = 3600000, pollMs = 100, managerFactory
         const view=manager.status(job.id);
         const json=JSON.stringify(view);
         let events=[];
-        if(provider==='claude') {
+        if(typeof manager.events==='function') {
           let page;
           do {page=manager.events(job.id,{after:cursor,limit:100});events.push(...page.events);cursor=page.nextCursor;}while(page.hasMore);
         }

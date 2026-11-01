@@ -5,11 +5,13 @@ import { statSync } from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 import { cleanupProcessGroup, signalTree } from './process-tree.js';
 import { ClaudeSdkJobs } from './claude-sdk-jobs.js';
+import { OpenCodeJobs } from './opencode-jobs.js';
 
-/** Claude uses Agent SDK. Codex consumes JSONL incrementally. */
+/** Claude uses Agent SDK, OpenCode its HTTP service. Codex consumes JSONL incrementally. */
 export class JobManager {
   constructor({ provider = 'claude', command, prefix = [], ...options } = {}) {
     if (provider === 'claude') return new ClaudeSdkJobs({ command, ...options });
+    if (provider === 'opencode') return new OpenCodeJobs(options);
     if (provider !== 'codex') throw Error('invalid provider');
     this.command=command||process.env.CODEX_COMMAND||'codex';this.prefix=prefix;this.jobs=new Map();
     this.timeoutMs=options.timeoutMs??900000;this.maxOutputBytes=options.maxOutputBytes??4000000;
