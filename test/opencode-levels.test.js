@@ -33,6 +33,10 @@ test('levels narrow monotonically', () => {
     assert.ok(rank[effect(narrow, action)] <= rank[effect(wide, action)], `${narrow} must not exceed ${wide} on ${action}`);
 });
 
+test('no level may start a subagent: a child session may run without the delegate\'s rules, loop guard included', () => {
+  for (const level of LEVELS) assert.equal(resolve(levelRules(level), 'subagent', 'general'), 'deny', level);
+});
+
 test('every level denies prompts it cannot answer and .env reads', () => {
   for (const level of LEVELS) {
     const rules = levelRules(level);

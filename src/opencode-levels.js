@@ -38,6 +38,8 @@ export function levelRules(level, { bridgeServerName = 'agentbridge', config } =
     ...(level === 'build' ? [] : READS.map(a => rule(a, '*', 'allow'))),
     ...(level === 'edit' ? [rule('edit', '*', 'allow')] : []),
     ...[...servers].map(s => rule(`${s}_*`, '*', 'deny')),
+    // Whether a child session inherits these rules is unmeasured; a subagent with its own could call agentbridge_*.
+    rule('subagent', '*', 'deny'),
     rule('question', '*', 'deny'),
     rule('external_directory', '*', 'deny'),
     rule('read', '*.env', 'deny'),
