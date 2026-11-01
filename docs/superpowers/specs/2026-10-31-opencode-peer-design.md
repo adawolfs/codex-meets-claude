@@ -55,8 +55,8 @@ Things that would make this a failure even if it technically worked:
   minutes of edits is unrecoverable. Every other failure in this system is
   recoverable; this one is not.
 - **A job that hangs.** OpenCode's permission model defaults to `ask` when no
-  rule matches, and `ask` with no interactive client never resolves. A
-  bridged job that silently waits forever is worse than one that fails.
+  rule matches, and an unanswered `ask` never resolves. A bridged job that
+  silently waits forever is worse than one that fails.
 - **Delegation loops.** An OpenCode job that can call `claude_*`, which calls
   `opencode_*`, consumes quota and locks without bound.
 - **A permission escape.** The bridge must never be a way to exceed the
@@ -71,10 +71,17 @@ Discovered, not chosen:
   target OpenCode 1.x; the v2 server API is an intentional breaking change.
   Neither is reusable. They did confirm the overall shape: HTTP API, sessions,
   programmatic permission answers, async start plus poll.
-- **`deny` always wins.** Configured deny rules and policies override anything
-  the bridge passes. A per-job level can narrow, never widen.
-- **No `ask` may survive.** Every rule a bridged job hits must resolve to
-  `allow` or `deny` before it runs.
+- **Policies hard-deny.** A policy turns `allow` or `ask` into `deny` after
+  rules and saved approvals run, and never grants access.
+- **Precedence of session rules is unverified.** `session.create` accepts a
+  `permissions` array. The documentation describes ordering for configuration
+  and agent rules but not session rules, so whether a session rule can
+  override a global `deny` is unknown. The user's ceiling guarantee depends on
+  the answer; it is pinned by a test against a real service before the level
+  model is built on it.
+- **`ask` must be answered, not avoided.** `permission.reply` exists, so a
+  request that reaches `ask` is answerable programmatically. What must never
+  happen is leaving one unanswered.
 - **Version coupling.** `@opencode/client` is published per OpenCode version
   (2.2.5 at time of writing). The bridge's pinned client should track the
   user's OpenCode.
@@ -99,10 +106,10 @@ the user asked for.
 `@opencode/client` with `@opencode/client/service`. `Service.ensure()` finds or
 starts the same service the TUI uses; `session.create` plus `session.prompt`
 run the job; `event.subscribe()` is a live async iterable the adapter drains
-into the existing bounded event pages. Permission requests arrive as events the
-bridge answers programmatically. Delegated sessions are real sessions on the
-user's service, so the user can open one in their own TUI and watch it there
-too. Trades off isolation: bridge jobs share a process with the user's
+into the existing bounded event pages; `session.interrupt` cancels. Permission
+requests arrive as `permission.asked` events and are answered with
+`permission.reply`. Delegated sessions are real sessions on the user's service,
+so the user can open one in their own TUI and watch it there too. Trades off isolation: bridge jobs share a process with the user's
 interactive work, and the pinned client tracks the user's OpenCode version.
 
 **C. Spawn a private `opencode serve` per job.** Full isolation and clean
@@ -139,50 +146,52 @@ leaves the tool-name prefix check intact and honest.
 
 ### Permission levels
 
-The boundary lives in the user's OpenCode configuration, not in this
-repository. It consists of top-level rules that apply to everything, plus three
-named agents that are the levels:
+`session.create` accepts a `permissions` array of `{action, resource, effect}`
+rules alongside `agent` and `model`. So the levels are rule sets the bridge
+owns, in this repository, versioned with the code — not agents the user must
+first define:
 
 | Level | Meaning |
 |-------|---------|
 | read-only | may read, search and report; no edits |
 | edit | may change files; no shell |
-| build | full working agent, within the user's top-level rules |
+| build | full working agent, within the user's configuration |
 
-`opencode_start` takes an optional level. The bridge maps it to that agent and
-runs with every rule resolved up front, so nothing reaches `ask`. Omitting the
-level uses the configured default. Naming a level that does not exist fails the
-job immediately rather than running with more or less rope than intended.
+`opencode_start` takes an optional level and passes its rules at session
+creation. Omitting it uses `read-only`, the safe end — an unlabelled job should
+not be the one that writes. An unknown level name fails the job immediately.
 
-Permission denials are recorded on the job view and surfaced as events, exactly
-as the Claude adapter already does with `permissionDenials`.
+This keeps the repository out of the user's permission config: the installer
+writes only the `mcp.servers` entry, as it does for the other two clients.
 
-**Who writes the agents.** The user's OpenCode config today has no permission
-rules and no agents, so the levels do not exist yet. The installer writes a
-starter set — the three agents, their rules, and the loop-guard denial — into
-`~/.config/opencode/opencode.json`, which the user is then free to retune. This
-means `configure-clients.js` owns part of the user's security boundary, so the
-same discipline applies to the `agent` and `permission` keys as to
-`mcp.servers`: write only the bridge's own entries, back up exactly those
-entries, and refuse to overwrite later user changes to them. The bridge also
-validates at job start — a level naming an agent that is absent fails
-immediately rather than falling back to a default with different rope.
+**The ceiling, and the thing to verify first.** The user's configuration is
+meant to remain the ceiling: a level narrows, never widens. Policies hard-deny
+after rules run, so they always hold. Whether a session rule can override a
+global `deny` is undocumented and must be settled by experiment before the
+level model is built on it. If global deny wins, the bridge passes its level
+rules as-is. If session rules win, the bridge reads the effective
+configuration and intersects — never emitting an `allow` for anything the
+user's configuration denies.
 
-The starter rules are a documented default, not a security claim. The user's
-own top-level rules and policies remain the ceiling.
+**Answering `ask`.** Requests surface as `permission.asked` events and are
+answered with `permission.reply({sessionID, requestID, decision})`. The bridge
+replies `reject`, records the denial in `permissionDenials`, and lets the job
+continue — the same policy the Claude adapter applies through `canUseTool`,
+though none of the plumbing is shared. `always` is never used: it would write
+a durable saved approval into the user's project.
 
-Note for the builder: the Claude adapter answers approval requests through the
-SDK's `canUseTool` callback. The OpenCode equivalent arrives over the event
-stream and is answered through the API. The policy is the same — deny, record,
-continue — but the plumbing is not shared.
+What must never happen is an unanswered request. Every `permission.asked` for
+a bridge-owned session gets a reply, including during shutdown and after the
+event stream drops and is resubscribed.
 
 ### Loop guard
 
 A delegated OpenCode job must not be able to call the bridge. The existing
 peers already do this: the Claude adapter sets
 `disallowedTools: ['mcp__*']`, and Codex launches with
-`mcp_servers.claude-bridge.enabled=false`. For OpenCode the equivalent is
-denying the bridge's MCP tool actions in each bridge agent. The user keeps
+`mcp_servers.claude-bridge.enabled=false`. For OpenCode the equivalent is a
+`deny` rule on the bridge server's MCP tool action, carried in every level's
+rule set — MCP tools take the action name `<server>_<tool>`. The user keeps
 those tools when driving OpenCode themselves; only the delegate loses them.
 
 ### Worktrees
@@ -307,8 +316,10 @@ This is a feature release: 0.4.0 across `package.json`, the MCP `serverInfo`,
 - Worktree creation mechanics: OpenCode's v2 worktree endpoints versus plain
   `git worktree`. Plain git is likely simpler and keeps the bridge's locking
   story self-contained, but either is acceptable.
-- The exact starter permission rules for the three agents, within the stated
-  meanings.
+- The exact rules in each level's rule set, within the stated meanings, over
+  the v2 action names (`read`, `edit`, `shell`, `glob`, `grep`, `webfetch`,
+  `websearch`, `subagent`, `skill`, `question`, `external_directory`,
+  `execute`, `<server>_<tool>`).
 - The worktree table's columns and the shape of `opencode_cleanup`'s input,
   given that it is keyed on worktree identity rather than jobId.
 - Whether the OpenCode adapter's per-job timeout differs from the shared
@@ -329,3 +340,10 @@ Settled by the author after an independent builder review, and worth the
 user's attention: orphaned-session recovery, the worktree table outside the
 prune window, resume re-entering the parent's worktree, and 2.x version
 compatibility rather than an exact pin.
+
+Amended after inspecting `@opencode/client@2.2.5`'s actual types: levels are
+bridge-owned session rule sets rather than agents written into the user's
+configuration, and `ask` is answered through `permission.reply` rather than
+pre-resolved. The precedence of session rules against a global `deny` is the
+one unknown, and is settled by experiment before the level model depends on
+it.
