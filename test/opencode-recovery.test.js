@@ -132,6 +132,65 @@ test('a service that has never run opencode recovers and reports zero unrecovere
   assert.equal(c.diagnostics().unrecovered,0);
 });
 
+// A finished job whose adapter could not prove its delegate stopped, as the coordinator stores it.
+function unconfirmedDone(store,project='/p',openCode=identity,requestId='d-'+project){
+  const id=orphan(store,'opencode',project,{...openCode,interrupt:'unconfirmed'},requestId);
+  store.update(id,{status:'cancelled',finishedAt:new Date().toISOString()});return id;
+}
+test('an unconfirmed orphan holds its session as well as its project',async t=>{
+  const {c,started}=await coordinator(t,s=>{orphan(s);},{abortSession:async()=>false});
+  const same=await c.start('opencode',{prompt:'same-session',cwd:'/q',sessionId:'s1'});
+  const other=await c.start('opencode',{prompt:'other-session',cwd:'/q',sessionId:'s2'});
+  const resumed=await c.start('claude',{prompt:'claude-same-id',cwd:'/r',sessionId:'s1'});
+  for(let i=0;i<5;i++)await tick();
+  assert.deepEqual(started.sort(),['claude-same-id','other-session']);
+  assert.equal(c.status('opencode',same.id).status,'queued');
+  assert.equal(c.status('opencode',other.id).status,'completed');assert.equal(c.status('claude',resumed.id).status,'completed');
+});
+test('a finished job whose interrupt was unconfirmed still holds its project and session, and survives prune',async t=>{
+  const {c,store,started}=await coordinator(t,s=>{unconfirmedDone(s);},{abortSession:async()=>false});
+  await c.start('claude',{prompt:'project',cwd:'/p'});await c.start('opencode',{prompt:'session',cwd:'/q',sessionId:'s1'});await c.start('claude',{prompt:'free',cwd:'/r'});
+  for(let i=0;i<5;i++)await tick();
+  assert.deepEqual(started,['free']);assert.equal(c.diagnostics().unrecovered,1);
+  store.maxHistory=1;for(let i=0;i<3;i++){const j=store.insert('claude',args('f'+i,'/z'),'/z');store.update(j.id,{status:'completed',finishedAt:new Date().toISOString()});}
+  store.prune();assert.equal(store.unrecovered().length,1);
+});
+test('a confirmed interrupt and a running orphan are counted together',async t=>{
+  const {c}=await coordinator(t,s=>{unconfirmedDone(s,'/p');orphan(s,'opencode','/q',identity,'run');unconfirmedDone(s,'/r',{sessionId:'s9',endpoint:'http://x'},'x');
+    const ok=orphan(s,'opencode','/s',identity,'ok');s.update(ok,{status:'completed',finishedAt:new Date().toISOString(),openCode:{...identity,interrupt:'confirmed'}});},{abortSession:async()=>false});
+  assert.equal(c.diagnostics().unrecovered,3);
+});
+test('cancel on an unconfirmed finished job retries the abort and says so when it fails',async t=>{
+  let answer=false;const calls=[];
+  const {c,store,started}=await coordinator(t,s=>{unconfirmedDone(s);s.insert('claude',args('queued'),'/p');},{abortSession:async s=>(calls.push(s),answer)});
+  for(let i=0;i<3;i++)await tick();
+  const held=store.unrecovered()[0];
+  await assert.rejects(c.cancel('opencode',held.id),/could not confirm.*locked/i);
+  assert.deepEqual(started,[]);assert.equal(c.diagnostics().unrecovered,1);assert.equal(store.get('opencode',held.id).openCode.interrupt,'unconfirmed');
+  answer=true;
+  const view=await c.cancel('opencode',held.id);
+  assert.equal(view.openCode.interrupt,'confirmed');assert.equal(view.status,'cancelled');
+  for(let i=0;i<5;i++)await tick();
+  assert.equal(c.diagnostics().unrecovered,0);assert.deepEqual(started,['go']);
+  assert.equal(calls.length,2);assert.deepEqual(calls[0],{provider:'opencode',sessionId:'s1',endpoint:'http://x'});
+});
+test('cancel on an unconfirmed running orphan releases it as interrupted once the abort lands, and a throwing abort is reported',async t=>{
+  let mode='throw';
+  const {c,store,started}=await coordinator(t,s=>{orphan(s);s.insert('claude',args('queued'),'/p');},{abortSession:async()=>{if(mode==='throw')throw Error('down');return mode==='ok';}});
+  for(let i=0;i<3;i++)await tick();
+  const id=store.unrecovered()[0].id;
+  await assert.rejects(c.cancel('opencode',id),/could not confirm/i);
+  mode='ok';
+  assert.equal((await c.cancel('opencode',id)).status,'interrupted');
+  for(let i=0;i<5;i++)await tick();
+  assert.deepEqual(started,['go']);
+});
+test('cancelling a queued or ordinary job is unchanged by holds',async t=>{
+  const {c}=await coordinator(t,s=>{orphan(s);},{abortSession:async()=>false});
+  const q=await c.start('claude',{prompt:'q',cwd:'/p'});
+  assert.equal(c.cancel('claude',q.id).status,'cancelled');
+});
+
 const fakeService=(url='http://x',calls=[])=>({calls,discover:async()=>url&&({url:url.replace('//','//bridge:secret@'),auth:{type:'basic',username:'bridge',password:'secret'}}),headers:()=>({authorization:'Basic x'})});
 const probe=(interrupt=async()=>({}))=>{const made=[];return {made,connect:o=>(made.push(o),{session:{interrupt}})};};
 test('the real aborter interrupts through a short-lived client at the recorded endpoint',async t=>{

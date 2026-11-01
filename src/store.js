@@ -18,6 +18,8 @@ const V2 = `ALTER TABLE jobs ADD COLUMN oc_session TEXT GENERATED ALWAYS AS (jso
   CREATE TABLE worktrees (id TEXT PRIMARY KEY, job TEXT NOT NULL, project TEXT NOT NULL, branch TEXT NOT NULL, path TEXT NOT NULL, created TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active');
   CREATE INDEX worktrees_job ON worktrees(job); CREATE INDEX worktrees_project ON worktrees(project);
   PRAGMA user_version=2;`;
+const INTERRUPTED = 'Service stopped during execution; inspect workspace before explicit resume.';
+const UNCONFIRMED = "COALESCE(json_extract(view,'$.openCode.interrupt'),'')='unconfirmed'";
 const stable = value => JSON.stringify(value, Object.keys(value).sort());
 export class Store {
   constructor({ directory, maxHistory = 1000, maxAgeMs = 30 * 86400000, maxEvents = 256 }) {
@@ -111,13 +113,19 @@ export class Store {
     const events = rows.slice(0,limit).map(r=>JSON.parse(r.body));
     return { events, nextCursor: events.at(-1)?.sequence ?? after, truncated: first !== null && after < first-1, hasMore: rows.length > limit };
   }
-  // Running rows no live job owns. After recover() these are exactly the orphans whose abort was not confirmed.
+  // Rows still holding a project and session: running rows no live job owns (orphans recover() could not abort), and
+  // opencode rows of any status whose delegate the adapter could not prove stopped.
   unrecovered(live = new Set()) {
-    return this.db.prepare("SELECT id,project FROM jobs WHERE status='running'").all().filter(r => !live.has(r.id));
+    return this.db.prepare(`SELECT id,provider,project,oc_session AS sessionId FROM jobs WHERE status='running' OR (provider='opencode' AND ${UNCONFIRMED})`).all().filter(r => !live.has(r.id));
+  }
+  // A confirmed abort releases a hold: a running row becomes interrupted, a finished one just stops being unconfirmed.
+  confirm(id) {
+    const { view } = this.record(id), openCode = { ...view.openCode, interrupt: 'confirmed' };
+    return view.status === 'running' ? this.update(id,{status:'interrupted',finishedAt:new Date().toISOString(),error:INTERRUPTED,progress:{phase:'interrupted',text:''},openCode}) : this.update(id,{openCode});
   }
   // The shared OpenCode service outlives this process, so its rows are released only once the abort is confirmed.
   async recover({ abortSession = async () => false } = {}) {
-    const interrupt = id => this.update(id,{status:'interrupted',finishedAt:new Date().toISOString(),error:'Service stopped during execution; inspect workspace before explicit resume.',progress:{phase:'interrupted',text:''}});
+    const interrupt = id => this.update(id,{status:'interrupted',finishedAt:new Date().toISOString(),error:INTERRUPTED,progress:{phase:'interrupted',text:''}});
     const rows = this.db.prepare("SELECT id,provider,oc_session AS sessionId,oc_endpoint AS endpoint FROM jobs WHERE status='running'").all();
     const orphans = rows.filter(r => r.provider === 'opencode' && r.sessionId && r.endpoint);
     const confirmed = await Promise.all(orphans.map(async r => { try { return (await abortSession({provider:r.provider,sessionId:r.sessionId,endpoint:r.endpoint})) === true; } catch { return false; } }));
@@ -128,7 +136,7 @@ export class Store {
   }
   prune() {
     const cutoff = new Date(Date.now()-this.maxAgeMs).toISOString();
-    this.db.prepare("DELETE FROM jobs WHERE status NOT IN ('queued','running') AND (finished<? OR id NOT IN (SELECT id FROM jobs WHERE status NOT IN ('queued','running') ORDER BY seq DESC LIMIT ?))").run(cutoff,this.maxHistory);
+    this.db.prepare(`DELETE FROM jobs WHERE status NOT IN ('queued','running') AND NOT (provider='opencode' AND ${UNCONFIRMED}) AND (finished<? OR id NOT IN (SELECT id FROM jobs WHERE status NOT IN ('queued','running') ORDER BY seq DESC LIMIT ?))`).run(cutoff,this.maxHistory);
     this.db.exec('PRAGMA incremental_vacuum(128);');
   }
   close() { if (this.db) { this.db.close(); this.db = null; } }

@@ -37,7 +37,7 @@ export function validateStart(provider, input) {
 export class Coordinator {
   constructor({ store, runner, resolveProject = defaultResolve, maxActive = 4, maxQueued = 100, abortSession = openCodeAborter(), onFatal = error => { console.error('Storage failure:',error.message); process.exitCode=1; } }) {
     for (const n of [maxActive,maxQueued]) if (!Number.isSafeInteger(n) || n < 1) throw Error('Invalid queue limit');
-    Object.assign(this,{store,runner,resolveProject,maxActive,maxQueued,onFatal});
+    Object.assign(this,{store,runner,resolveProject,maxActive,maxQueued,abortSession,onFatal});
     this.active=new Map();this.closing=false;this.pumping=false;this.recovered=false;
     // Nothing is eligible until recovery has settled; a row it could not release keeps its project out of pump.
     store.recover({abortSession}).then(()=>{if(this.closing)return;store.prune();this.recovered=true;this.pump();}).catch(error=>{if(!this.closing)this.fail(error);});
@@ -68,10 +68,10 @@ export class Coordinator {
     if(this.closing||this.pumping||!this.recovered)return;
     this.pumping=true;
     try {
-      const held=new Set(this.store.unrecovered(new Set(this.active.keys())).map(r=>r.project));
+      const holds=this.holds(),held=new Set(holds.map(r=>r.project)),heldSessions=new Set(holds.filter(r=>r.sessionId).map(r=>r.provider+'\0'+r.sessionId));
       for(const job of this.store.queued()){
         if(this.active.size>=this.maxActive)break;
-        const busy=held.has(job.project)||[...this.active.values()].some(a=>a.project===job.project ||
+        const busy=held.has(job.project)||(job.args.sessionId&&heldSessions.has(job.provider+'\0'+job.args.sessionId))||[...this.active.values()].some(a=>a.project===job.project ||
           (job.args.sessionId && a.provider===job.provider && a.sessionId===job.args.sessionId));
         if(busy)continue;
         this.store.update(job.id,{status:'running',startedAt:timestamp(),progress:{phase:'starting',text:''}});
@@ -102,6 +102,7 @@ export class Coordinator {
     } catch(error){this.fail(error);}
     finally {this.active.delete(record.id);queueMicrotask(()=>this.pump());}
   }
+  holds(){return this.store.unrecovered(new Set(this.active.keys()));}
   fail(error){
     this.closing=true;
     for(const record of this.active.values())record.controller.abort();
@@ -113,12 +114,22 @@ export class Coordinator {
   cancel(provider,id){
     const job=this.store.get(provider,id);
     if(job.status==='queued'){const result=this.store.update(id,{status:'cancelled',finishedAt:timestamp(),progress:{phase:'cancelled',text:''}});this.store.prune();return result;}
+    if(this.holds().some(r=>r.id===id))return this.release(job);
     const record=this.active.get(id);
     if(record){record.cancelled=true;this.store.update(id,{cancelRequested:true});record.controller.abort();}
     return this.store.get(provider,id);
   }
+  // Cancelling a held row retries its abort; only a confirmed one releases the project and session.
+  async release(job){
+    const {sessionId,endpoint}=job.openCode??{};
+    let ok=false;
+    try{ok=sessionId&&endpoint&&(await this.abortSession({provider:job.provider,sessionId,endpoint}))===true;}catch{}
+    if(!ok)throw Error(`Could not confirm that OpenCode session ${sessionId} stopped, so its project stays locked; retry cancel once the OpenCode service is reachable.`);
+    this.store.confirm(job.id);queueMicrotask(()=>this.pump());
+    return this.store.get(job.provider,job.id);
+  }
   diagnostics(){
-    return {version:'0.3.0',status:this.closing?'stopping':'ready',counts:this.store.counts(),unrecovered:this.store.unrecovered(new Set(this.active.keys())).length,
+    return {version:'0.3.0',status:this.closing?'stopping':'ready',counts:this.store.counts(),unrecovered:this.holds().length,
       limits:{maxActive:this.maxActive,maxQueued:this.maxQueued,maxHistory:this.store.maxHistory,maxAgeMs:this.store.maxAgeMs,maxEvents:this.store.maxEvents}};
   }
   async shutdown(){
