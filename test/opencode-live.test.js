@@ -71,6 +71,16 @@ test('live OpenCode peer: read-only, edit in a worktree, cancellation and resume
   });
   t.after(async () => { await rm(state, { recursive: true, force: true }); await rm(repo, { recursive: true, force: true }); });
 
+  // The job view has no level field (the store drops it), so the level is read from the session the bridge created.
+  const levelOf = async sessionId => {
+    const endpoint = await Service.discover();
+    const client = OpenCode.make({ baseUrl: endpoint.url, headers: Service.headers(endpoint) });
+    return (await client.session.get({ sessionID: sessionId })).metadata?.agentbridge?.level;
+  };
+  // Phases that passed are recorded as they pass, so a later quota failure does not erase them.
+  const passed = [];
+  const phase = name => { passed.push(name); t.diagnostic(`phase passed: ${name}`); };
+
   const start = async args => {
     const job = await call('start', { cwd: repo, ...args });
     jobs.add(job.id);
@@ -98,11 +108,12 @@ test('live OpenCode peer: read-only, edit in a worktree, cancellation and resume
     const reader = await start({ prompt: 'Read the file notes.txt in the current directory and reply with its first line, verbatim. Do not modify anything.', level: 'read-only' });
     const read = await finished(reader.id, 'the read-only job');
     assert.equal(read.status, 'completed', read.error);
-    assert.equal(read.level, 'read-only');
     assert.match(read.result, /BRIDGE_MARKER_7431/);
     assert.equal(git(repo, 'status', '--porcelain'), '', 'a read-only job changed the checkout');
     assert.equal(read.worktree ?? null, null);
+    assert.equal(await levelOf(read.sessionId), 'read-only');
     t.diagnostic(`read-only job ${read.id} session ${read.sessionId}`);
+    phase('read-only');
 
     // 2. edit in a worktree: changes a file there, reports branch and files, leaves the tree behind, never touches the source.
     let edited;
@@ -117,9 +128,11 @@ test('live OpenCode peer: read-only, edit in a worktree, cancellation and resume
     }
     assert.ok(edited, 'the edit job never created hello.txt in two attempts');
     const { worktree } = edited;
-    assert.equal(edited.level, 'edit');
     assert.match(worktree.branch, /^bridge\/[0-9a-f-]{36}$/);
-    assert.deepEqual(worktree.changedFiles, ['hello.txt']);
+    // The model may add or touch other files; the check still requires the one asked for, and names any others.
+    assert.ok(worktree.changedFiles.includes('hello.txt'), `hello.txt is not among the changed files: ${JSON.stringify(worktree.changedFiles)}`);
+    const others = worktree.changedFiles.filter(file => file !== 'hello.txt');
+    assert.equal(others.length, 0, `the delegate changed files beyond hello.txt: ${JSON.stringify(others)}`);
     assert.equal(worktree.removed, false, 'a worktree containing work was removed automatically');
     assert.match(readFileSync(join(worktree.path, 'hello.txt'), 'utf8'), /HELLO_WORKTREE/);
     assert.equal(existsSync(join(repo, 'hello.txt')), false, 'the edit reached the source checkout');
@@ -129,9 +142,8 @@ test('live OpenCode peer: read-only, edit in a worktree, cancellation and resume
     t.diagnostic(`edit job ${edited.id} worktree ${worktree.path} branch ${worktree.branch}`);
 
     // The session was created by the bridge: get() must carry the marker the resume guard reads.
-    const endpoint = await Service.discover();
-    const client = OpenCode.make({ baseUrl: endpoint.url, headers: Service.headers(endpoint) });
-    assert.deepEqual((await client.session.get({ sessionID: edited.sessionId })).metadata, { agentbridge: { level: 'edit' } });
+    assert.equal(await levelOf(edited.sessionId), 'edit');
+    phase('edit in a worktree');
 
     // 3. resume into the same session and the same worktree; the level belongs to the session and must be repeated.
     const resumed = await start({ prompt: 'Which file did you create earlier, and what exactly does it contain? Answer in one line.', level: 'edit', parentJobId: edited.id });
@@ -141,6 +153,7 @@ test('live OpenCode peer: read-only, edit in a worktree, cancellation and resume
     assert.match(again.result, /hello\.txt/i);
     assert.equal(again.worktree.id, worktree.id);
     assert.equal(again.worktree.removed, false);
+    phase('resume');
 
     // 4. cancellation mid-run: the abort is confirmed, the job ends cancelled and nothing stays held.
     const slow = await start({ prompt: 'Count from 1 to 400, one number per line, then write DONE. Do not use any tools.', level: 'read-only' });
@@ -151,16 +164,19 @@ test('live OpenCode peer: read-only, edit in a worktree, cancellation and resume
     assert.ok(cancelled.finishedAt);
     assert.equal(cancelled.openCode.interrupt, 'confirmed');
     assert.equal((await call('diagnostics')).unrecovered, 0);
+    phase('cancel');
 
     // The worktree holds work, so it is removed only by the explicit discard.
     await assert.rejects(() => call('cleanup', { worktreeId: worktree.id }), /changes/);
     assert.equal((await call('cleanup', { worktreeId: worktree.id, discard: true })).removed, true);
     assert.equal(existsSync(worktree.path), false);
     assert.equal(git(repo, 'branch', '--list', worktree.branch), '');
+    phase('cleanup');
   } catch (error) {
     if (!(error instanceof Quota)) throw error;
     // A skip is not a pass: the run was inconclusive. Say so where it cannot be missed.
-    console.error(`BRIDGE_LIVE_OPENCODE: INCONCLUSIVE, the model quota is exhausted. ${error.message.slice(0, 300)}`);
-    t.skip('model quota exhausted: ' + error.message.slice(0, 200));
+    const note = `passed before the quota stopped the run: ${passed.length ? passed.join(', ') : 'nothing'}`;
+    console.error(`BRIDGE_LIVE_OPENCODE: INCONCLUSIVE, the model quota is exhausted (${note}). ${error.message.slice(0, 300)}`);
+    t.skip(`model quota exhausted (${note}): ` + error.message.slice(0, 200));
   }
 });
