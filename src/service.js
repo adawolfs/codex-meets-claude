@@ -1,8 +1,10 @@
 import { createServer } from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync,chmodSync,unlinkSync,existsSync,accessSync,constants } from 'node:fs';
-import { join,resolve } from 'node:path';
+import { mkdirSync,chmodSync,unlinkSync,existsSync,accessSync,readFileSync,constants } from 'node:fs';
+import { join,resolve,dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { OpenCode } from '@opencode/client';
+import { Service } from '@opencode/client/service';
 import { Store } from './store.js';
 import { Coordinator } from './coordinator.js';
 import { createRunner } from './runner.js';
@@ -17,7 +19,32 @@ export function safeError(error){
 function executable(path){
  try{accessSync(path,constants.X_OK);return {path,available:true,authentication:'not_probed'};}catch{return {path:path||null,available:false,authentication:'not_probed'};}
 }
-export async function startService({directory=stateDirectory(),runner=createRunner({timeoutMs:Number(process.env.BRIDGE_TIMEOUT_MS||3600000)}),resolveProject,maxActive=Number(process.env.BRIDGE_MAX_ACTIVE||4),maxQueued=Number(process.env.BRIDGE_MAX_QUEUED||100)}={}){
+// The installed client's version, read from its own package.json (the package does not export it).
+let pinned;
+function clientVersion(){
+ if(pinned)return pinned;
+ try{
+  let dir=dirname(fileURLToPath(import.meta.resolve('@opencode/client')));
+  for(;dir!==dirname(dir);dir=dirname(dir)){
+   try{const meta=JSON.parse(readFileSync(join(dir,'package.json'),'utf8'));if(meta.name==='@opencode/client')return pinned=String(meta.version);}catch{}
+  }
+ }catch{}
+ return 'unknown';
+}
+// Read-only: discover() never starts a service and the only request is server.info(); no inference, no credential check beyond the registered ones.
+export const openCodeProbe=({service=Service,connect=o=>OpenCode.make(o),timeoutMs=2000}={})=>async()=>{
+ const out=(status,version=null)=>({status,serviceVersion:typeof version==='string'&&version?version.slice(0,64):null,clientVersion:clientVersion()});
+ let timer;
+ try{
+  return await Promise.race([(async()=>{
+   const live=await service.discover();
+   if(!live)return out('unreachable');
+   const {version}=await connect({baseUrl:live.url,headers:service.headers(live)}).server.info();
+   return out(/^2\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$/.test(version)?'ready':'incompatible',version);
+  })(),new Promise(r=>{timer=setTimeout(r,timeoutMs,out('unreachable'));})]);
+ }catch{return out('unreachable');}finally{clearTimeout(timer);}
+};
+export async function startService({directory=stateDirectory(),probeOpenCode=openCodeProbe(),runner=createRunner({timeoutMs:Number(process.env.BRIDGE_TIMEOUT_MS||3600000)}),resolveProject,maxActive=Number(process.env.BRIDGE_MAX_ACTIVE||4),maxQueued=Number(process.env.BRIDGE_MAX_QUEUED||100)}={}){
  if(process.platform==='win32')throw Error('Persistent service runs in Linux/WSL');
  if(!directory.startsWith('/')||directory.startsWith('/mnt/'))throw Error('State directory must be on the Linux filesystem');
  mkdirSync(directory,{recursive:true,mode:0o700});chmodSync(directory,0o700);
@@ -49,7 +76,7 @@ export async function startService({directory=stateDirectory(),runner=createRunn
     else if(action==='list_jobs')value=coordinator.list(provider,args);
     else if(action==='cleanup')value=await coordinator.cleanup(provider,{worktreeId:args.worktreeId,discard:args.discard});
     else if(action==='events')value=coordinator.events(provider,args.jobId,{after:args.after,limit:args.limit});
-    else value={...coordinator.diagnostics(),storage:directory,executables:{claude:executable(process.env.CLAUDE_COMMAND),codex:executable(process.env.CODEX_COMMAND)}};
+    else value={...coordinator.diagnostics(),storage:directory,executables:{claude:executable(process.env.CLAUDE_COMMAND),codex:executable(process.env.CODEX_COMMAND)},opencode:await probeOpenCode().catch(()=>({status:'unreachable',serviceVersion:null,clientVersion:clientVersion()}))};
     send(200,value);
    }catch(error){send(400,{error:safeError(error)});}
   });
@@ -69,5 +96,5 @@ if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){
  let closing=false;
  const stop=async()=>{if(closing)return;closing=true;const deadline=setTimeout(()=>process.exit(1),25000);deadline.unref();await service.close();clearTimeout(deadline);};
  process.on('SIGTERM',()=>void stop());process.on('SIGINT',()=>void stop());
- console.error('agent-bridge 0.3.0 ready');
+ console.error('agent-bridge 0.4.0 ready');
 }

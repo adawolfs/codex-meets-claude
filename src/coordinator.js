@@ -5,7 +5,7 @@ import { OpenCode, isSessionNotFoundError } from '@opencode/client';
 import { Service } from '@opencode/client/service';
 import { resolveProject as defaultResolve } from './paths.js';
 import { pageArgs } from './store.js';
-import { PROVIDERS, LEVELS } from './persistent-tools.js';
+import { PROVIDERS, LEVELS, OPENCODE_MODEL } from './persistent-tools.js';
 import { sourceChanges, planWorktree, createWorktree, worktreeStatus, removeWorktree, inside } from './worktrees.js';
 const timestamp = () => new Date().toISOString();
 const bare = url => { const u = new URL(url); u.username = u.password = u.search = u.hash = ''; return u.href.replace(/\/$/, ''); };
@@ -29,8 +29,10 @@ export function validateStart(provider, input) {
   for (const key of Object.keys(input)) if (!keys.includes(key)) throw Error('Unknown argument: '+key);
   if (typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 100000) throw Error('Invalid prompt (1-100000 characters)');
   if (typeof input.cwd !== 'string' || !input.cwd || input.cwd.length > 4096) throw Error('Invalid cwd');
-  for (const key of ['sessionId','model','requestId','parentJobId'])
-    if (input[key] !== undefined && (typeof input[key] !== 'string' || !/^[a-zA-Z0-9._-]{1,128}$/.test(input[key]))) throw Error('Invalid '+key);
+  for (const key of ['sessionId','model','requestId','parentJobId']) {
+    const pattern = key === 'model' && provider === 'opencode' ? OPENCODE_MODEL : /^[a-zA-Z0-9._-]{1,128}$/;
+    if (input[key] !== undefined && (typeof input[key] !== 'string' || !pattern.test(input[key]))) throw Error('Invalid '+key);
+  }
   if (input.permissionMode !== undefined && !['plan','acceptEdits'].includes(input.permissionMode)) throw Error('Invalid permissionMode');
   if (input.maxTurns !== undefined && (!Number.isSafeInteger(input.maxTurns) || input.maxTurns < 1 || input.maxTurns > 1000)) throw Error('Invalid maxTurns');
   if (input.maxBudgetUsd !== undefined && (typeof input.maxBudgetUsd !== 'number' || !Number.isFinite(input.maxBudgetUsd) || input.maxBudgetUsd <= 0)) throw Error('Invalid maxBudgetUsd');
@@ -211,7 +213,7 @@ export class Coordinator {
   }
   diagnostics(){
     const worktrees=this.store.listWorktrees();
-    return {version:'0.3.0',status:this.closing?'stopping':'ready',counts:this.store.counts(),unrecovered:this.holds().length,worktrees:{count:worktrees.length,items:worktrees.slice(0,100)},
+    return {version:'0.4.0',status:this.closing?'stopping':'ready',counts:this.store.counts(),unrecovered:this.holds().length,worktrees:{count:worktrees.length,items:worktrees.slice(0,100)},
       limits:{maxActive:this.maxActive,maxQueued:this.maxQueued,maxHistory:this.store.maxHistory,maxAgeMs:this.store.maxAgeMs,maxEvents:this.store.maxEvents}};
   }
   async shutdown(){

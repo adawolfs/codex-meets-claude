@@ -4,6 +4,7 @@ import { statSync } from 'node:fs';
 import { OpenCode } from '@opencode/client';
 import { Service } from '@opencode/client/service';
 import { LEVELS, levelRules } from './opencode-levels.js';
+import { OPENCODE_MODEL as MODEL } from './persistent-tools.js';
 
 const now = () => new Date().toISOString();
 const bounded = (value, limit = 4000) => String(value ?? '').slice(0, limit);
@@ -21,7 +22,6 @@ const confirmed = (fn, ms) => {
 const TERMINAL = /^session\.execution\.(succeeded|failed|interrupted)$/;
 // Metadata key marking sessions this bridge created; only those may be resumed.
 const MARK = 'agentbridge';
-const MODEL = /^([a-zA-Z0-9._-]{1,64})\/([a-zA-Z0-9._:/-]{1,192})$/;
 
 /** One OpenCode session turn per job, driven over the shared local service's HTTP API. */
 export class OpenCodeJobs {
@@ -49,7 +49,7 @@ export class OpenCodeJobs {
     if (sessionId !== undefined && (typeof sessionId !== 'string' || !/^[a-zA-Z0-9._-]{1,128}$/.test(sessionId)))
       throw new Error('Invalid sessionId');
     if (model !== undefined && (typeof model !== 'string' || !MODEL.test(model)))
-      throw new Error('model must be providerID/modelID');
+      throw new Error('model must be providerID/modelID or providerID/modelID#variant');
     if (!LEVELS.includes(level)) throw new Error('Invalid level');
     // Worktrees are created by the coordinator, which hands this adapter the worktree's cwd.
     if (worktree !== undefined && worktree !== false) throw new Error('worktree jobs are not supported by the adapter directly');
@@ -79,9 +79,9 @@ export class OpenCodeJobs {
     record.live.promise.catch(() => {});
     record.finish.promise.catch(() => {});
     this.jobs.set(view.id, record);
-    const [, providerID, id] = model?.match(MODEL) ?? [];
+    const [, providerID, id, variant] = model?.match(MODEL) ?? [];
     // Defer launch so immediate cancellation is observed before contacting OpenCode.
-    record.done = Promise.resolve().then(() => this.run(record, { prompt, sessionId, level, model: model && { providerID, id } }));
+    record.done = Promise.resolve().then(() => this.run(record, { prompt, sessionId, level, model: model && { providerID, id, ...(variant ? { variant } : {}) } }));
     return this.snapshot(record);
   }
 

@@ -1,7 +1,8 @@
 import { StringDecoder } from 'node:string_decoder';
 import { ServiceClient } from './client.js';
-import { toolsFor,validateCall } from './persistent-tools.js';
-const provider=process.env.BRIDGE_PROVIDER||'claude',tools=toolsFor(provider),client=new ServiceClient();
+import { PROVIDERS,surface,validateCall } from './persistent-tools.js';
+if(!PROVIDERS.includes(process.env.BRIDGE_CLIENT)){console.error('BRIDGE_CLIENT must be one of '+PROVIDERS.join(', ')+(process.env.BRIDGE_PROVIDER?' (BRIDGE_PROVIDER is no longer read)':''));process.exit(1);}
+const {tools,resolve}=surface(process.env.BRIDGE_CLIENT),client=new ServiceClient();
 let pending='',inflight=0,closed=false;
 const decoder=new StringDecoder('utf8');
 process.stdout.on('error',()=>process.exit(0));
@@ -18,14 +19,14 @@ async function handle(line){
  try{
   const params=r.params??{};if(!params||typeof params!=='object'||Array.isArray(params))throw Error('Invalid params');
   let result;
-  if(r.method==='initialize')result={protocolVersion:['2024-11-05','2025-03-26','2025-06-18'].includes(params.protocolVersion)?params.protocolVersion:'2025-03-26',capabilities:{tools:{}},serverInfo:{name:'agent-bridge-persistent',version:'0.3.0'}};
+  if(r.method==='initialize')result={protocolVersion:['2024-11-05','2025-03-26','2025-06-18'].includes(params.protocolVersion)?params.protocolVersion:'2025-03-26',capabilities:{tools:{}},serverInfo:{name:'agent-bridge-persistent',version:'0.4.0'}};
   else if(r.method==='ping')result={};
   else if(r.method==='tools/list')result={tools};
   else if(r.method==='tools/call'){
    try{
-    const name=params.name;
-    if(typeof name!=='string'||!name.startsWith(provider+'_'))throw Error('Unknown tool');
-    const action=name.slice(provider.length+1),args=params.arguments??{};validateCall(provider,action,args);
+    const target=resolve(params.name);
+    if(!target)throw Error('Unknown tool');
+    const {provider,action}=target,args=params.arguments??{};validateCall(provider,action,args);
     const value=await client.call(provider,action,args);
     result={content:[{type:'text',text:JSON.stringify(value)}]};
    }catch(error){result={isError:true,content:[{type:'text',text:error.message}]};}

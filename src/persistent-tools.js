@@ -1,6 +1,8 @@
 const schema=(properties,required=[])=>({type:'object',properties,required,additionalProperties:false});
 const str={type:'string'},cursor={type:'integer',minimum:0},limit={type:'integer',minimum:1,maximum:100};
 export const PROVIDERS=['claude','codex','opencode'],LEVELS=['read-only','edit','build'];
+// providerID/modelID with an optional #variant; claude and codex keep the plain identifier pattern.
+export const OPENCODE_MODEL=/^([a-zA-Z0-9._-]{1,64})\/([a-zA-Z0-9._:/-]{1,192})(?:#([a-zA-Z0-9._-]{1,64}))?$/;
 export function toolsFor(provider){
  if(!PROVIDERS.includes(provider))throw Error('Invalid provider');
  const start={prompt:str,cwd:str,sessionId:str,model:str,requestId:str,parentJobId:str};
@@ -32,4 +34,11 @@ export function validateCall(provider,action,args){
  }
  for(const key of tool.inputSchema.required)if(!Object.hasOwn(args,key))throw Error('Missing '+key);
  return tool;
+}
+// What a client is offered: the tools of every provider but itself. A name resolves only if it is exactly one of them.
+export function surface(client){
+ if(!PROVIDERS.includes(client))throw Error('Invalid client');
+ const tools=[],byName=new Map();
+ for(const provider of PROVIDERS.filter(p=>p!==client))for(const tool of toolsFor(provider)){tools.push(tool);byName.set(tool.name,{provider,action:tool.name.slice(provider.length+1)});}
+ return {tools,resolve:name=>typeof name==='string'?byName.get(name):undefined};
 }
