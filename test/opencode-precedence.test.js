@@ -10,10 +10,11 @@ import { Service } from '@opencode/client/service';
 // so it only runs on request. Measured on OpenCode 2.2.5 — see the task report.
 const enabled = process.env.BRIDGE_LIVE_OPENCODE === '1';
 const PROMPT = 'Use the write tool (not the shell, not any other tool) to create a file named precedence-probe.txt in the current directory containing exactly the text PROBE. Do nothing else.';
-const within = (promise, ms, what) => Promise.race([
-  promise,
-  new Promise((_, reject) => setTimeout(() => reject(new Error(`timed out after ${ms}ms: ${what}`)), ms).unref()),
-]);
+const within = (promise, ms, what) => {
+  let timer;
+  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms: ${what}`)), ms); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+};
 
 async function probe(client, dir, permissions, cleanups) {
   const session = await client.session.create({ location: { directory: dir }, ...(permissions ? { permissions } : {}) });
@@ -32,13 +33,16 @@ async function probe(client, dir, permissions, cleanups) {
   const trace = [];
   const live = Promise.withResolvers();
   const finished = Promise.withResolvers();
+  // Either may reject before anything awaits it; the awaiting code below still sees the rejection.
+  live.promise.catch(() => {});
+  finished.promise.catch(() => {});
   const pump = (async () => {
     try {
       for await (const event of { [Symbol.asyncIterator]: () => events }) {
         if (event.type === 'server.connected') live.resolve();
         const d = event.data;
         if (d?.sessionID !== sessionID) continue;
-        if (!/delta|usage|instructions/.test(event.type)) trace.push(event.type === 'session.text.ended' ? `${event.type}: ${d.text}` : event.type);
+        if (!/delta|usage|instructions/.test(event.type)) trace.push(event.type === 'session.text.ended' ? `${event.type}: ${d.text}` : event.type === 'session.step.failed' ? `${event.type}: ${JSON.stringify(d.error)}` : event.type);
         if (event.type === 'session.tool.input.started') names.set(d.id, d.name);
         if (event.type === 'session.tool.called') trace.push(JSON.stringify(d.input));
         if (event.type === 'session.tool.success') tools.push({ tool: names.get(d.id), ok: true });
@@ -66,7 +70,7 @@ async function probe(client, dir, permissions, cleanups) {
   return { permissions: session.permissions, outcome, tools, asked, trace };
 }
 
-test('live OpenCode: session permissions override a global edit deny, and merge with it', { skip: !enabled, timeout: 420000 }, async t => {
+test('live OpenCode: session permissions override a global edit deny, and merge with it', { skip: !enabled, timeout: 560000 }, async t => {
   const endpoint = await Service.ensure();
   const client = OpenCode.make({ baseUrl: endpoint.url, headers: Service.headers(endpoint) });
   const cleanups = [];
@@ -77,10 +81,10 @@ test('live OpenCode: session permissions override a global edit deny, and merge 
   });
 
   await mkdir('/tmp/opencode', { recursive: true });
-  async function project() {
+  async function project({ deny = true } = {}) {
     const dir = await mkdtemp('/tmp/opencode/precedence-');
     dirs.push(dir);
-    await writeFile(join(dir, 'opencode.json'), JSON.stringify({ permissions: [{ action: 'edit', resource: '*', effect: 'deny' }] }));
+    await writeFile(join(dir, 'opencode.json'), JSON.stringify({ permissions: deny ? [{ action: 'edit', resource: '*', effect: 'deny' }] : [] }));
     const config = await client.config.get({ location: { directory: dir } });
     assert.ok(config.some(e => e.path === join(dir, 'opencode.json')), 'the temporary opencode.json was not loaded as configuration');
     return dir;
@@ -88,10 +92,10 @@ test('live OpenCode: session permissions override a global edit deny, and merge 
   const wrote = arm => arm.tools.filter(e => e.tool === 'write');
   // The default model is small and sometimes answers without calling the tool, or stalls. That is
   // inconclusive, never a pass: retry in a fresh project, and fail if no attempt is ever observed.
-  async function arm(name, permissions) {
+  async function arm(name, permissions, projectOptions) {
     const failures = [];
     for (let attempt = 1; attempt <= 3; attempt++) {
-      const dir = await project();
+      const dir = await project(projectOptions);
       const result = await probe(client, dir, permissions, cleanups).catch(error => ({ error: error.message }));
       if (result.error || wrote(result).length === 0) {
         failures.push(result.error ?? `no write attempt: ${JSON.stringify(result)}`);
@@ -102,9 +106,15 @@ test('live OpenCode: session permissions override a global edit deny, and merge 
     assert.fail(`${name} arm inconclusive after 3 attempts: ${failures.join(' | ')}`);
   }
 
+  // A denied write must be the deny's doing: the tool is withheld ("No tool named"), with no permission prompt.
+  const deniedByConfig = (name, result) => {
+    assert.ok(wrote(result).every(e => !e.ok && /No tool named "write"/.test(e.error ?? '')), `${name}: write was not withheld by the global deny: ${JSON.stringify(result)}`);
+    assert.deepEqual(result.asked, [], `${name}: a permission prompt fired, so the rejection was not the global deny: ${JSON.stringify(result)}`);
+  };
+
   // Control: the deny alone must take effect, and we must have seen the write attempt rejected.
   const control = await arm('control');
-  assert.ok(wrote(control).every(e => !e.ok), `control: the global deny did not stop the write tool: ${JSON.stringify(control)}`);
+  deniedByConfig('control', control);
 
   // Allow arm: a session-level edit allow overrides the global deny.
   const allowed = await arm('allow', [{ action: 'edit', resource: '*', effect: 'allow' }]);
@@ -114,8 +124,14 @@ test('live OpenCode: session permissions override a global edit deny, and merge 
   assert.ok(created.length > 0, `write reported success but nothing was created: ${JSON.stringify(allowed)}`);
   assert.match(await readFile(join(allowed.dir, created[0]), 'utf8'), /PROBE/);
 
-  // Unrelated arm: a session whose only rule is about `read` must neither widen nor drop the global edit deny,
-  // i.e. session rules merge with the configuration rather than replacing it.
-  const unrelated = await arm('unrelated', [{ action: 'read', resource: '*', effect: 'allow' }]);
-  assert.ok(wrote(unrelated).every(e => !e.ok), `session permissions replaced the config ruleset instead of merging with it: ${JSON.stringify(unrelated)}`);
+  // Unrelated arm: a session whose only rule is about `read` leaves the global edit deny fully in force
+  // (same signature as the control: tool withheld, no prompt), i.e. session rules merge with the configuration.
+  const readOnly = [{ action: 'read', resource: '*', effect: 'allow' }];
+  const unrelated = await arm('unrelated', readOnly);
+  deniedByConfig('unrelated', unrelated);
+
+  // Positive control for the unrelated arm: the same read-only session without a config deny can write. So if the
+  // session rules had replaced the configuration, the write above would have gone through (or asked), not been withheld.
+  const ungated = await arm('ungated', readOnly, { deny: false });
+  assert.ok(wrote(ungated).some(e => e.ok), `read-only session without a config deny could not write: ${JSON.stringify(ungated)}`);
 });
