@@ -21,7 +21,7 @@ Claude admite permissionMode: plan (predeterminado) o acceptEdits, model, maxTur
 
 ## Instalación WSL
 
-Requiere Node >=22.13, systemd de usuario, git, ambos CLI autenticados y ejecutables en ~/.local/bin (o CLAUDE_COMMAND/CODEX_COMMAND explícitos). node:sqlite es experimental en Node 22; no necesita un módulo nativo adicional.
+Requiere Node >=22.13, systemd de usuario, git, los CLI de Claude y Codex autenticados y ejecutables en ~/.local/bin (o CLAUDE_COMMAND/CODEX_COMMAND explícitos); OpenCode es opcional para instalar. node:sqlite es experimental en Node 22; no necesita un módulo nativo adicional.
 
 Desde este repositorio en Linux:
 
@@ -40,7 +40,11 @@ En Windows, ejecuta con Node nativo scripts/configure-clients.js pasando las rut
 node scripts/configure-clients.js /ruta/linux/a/node /ruta/linux/al/repositorio Ubuntu
 ~~~
 
-El comando registra wsl.exe → Node Linux → launch.js para ambos clientes. Actualiza solo claude-bridge en Codex y codex-bridge en Claude; cada cambio genera un respaldo de esas entradas en ~/.agent-bridge-backups. No copia la configuración de cuenta ni credenciales.
+El comando registra wsl.exe → Node Linux → launch.js para los tres clientes. El argumento de launch.js es el cliente que se registra (claude, codex u opencode) y cada cliente recibe las herramientas de los otros dos. Actualiza solo claude-bridge en Codex, codex-bridge en Claude y agentbridge bajo mcp.servers en ~/.config/opencode/opencode.json (o $XDG_CONFIG_HOME/opencode); cada cambio genera un único respaldo de esas tres entradas en ~/.agent-bridge-backups. No copia la configuración de cuenta ni credenciales.
+
+El nombre agentbridge, sin guion, es obligatorio: los niveles de permiso de OpenCode deniegan agentbridge_<herramienta> para que un delegado no vuelva a llamar al puente. Si ~/.config/opencode contiene opencode.jsonc con comentarios, el comando se niega a reescribirlo (los comentarios no se recuperarían con el rollback); añade a mano la entrada o quita los comentarios. OpenCode recarga su configuración sin reiniciar; Claude Code y Codex necesitan reiniciarse para ver el cambio.
+
+Si actualizas desde una versión con dos clientes, vuelve a ejecutar el comando: los registros antiguos de Codex y Claude pasan al proveedor equivocado como argumento (Codex arrancaba launch.js claude) y reciben las herramientas incorrectas. Hasta entonces el puente avisa de ello en el arranque. Con la instalación del servicio, OPENCODE_COMMAND (por defecto ~/.opencode/bin/opencode) se guarda en la unidad; si falta, la instalación continúa con un aviso.
 
 Rollback, con el Node del sistema donde cambiaste las configuraciones:
 

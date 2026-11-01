@@ -9,15 +9,15 @@ function quote(value,exec=false){
  const safe=value.replaceAll('\\','\\\\').replaceAll('"','\\"').replaceAll('%','%%');
  return '"'+(exec?safe.replaceAll('$','$$'):safe)+'"';
 }
-export function serviceUnit({node,repo,home,claude,codex,directory}){
- const env={PATH:dirname(node)+':'+join(home,'.local','bin')+':/usr/local/bin:/usr/bin:/bin',CLAUDE_COMMAND:claude,CODEX_COMMAND:codex,BRIDGE_STATE_DIR:directory};
+export function serviceUnit({node,repo,home,claude,codex,opencode,directory}){
+ const env={PATH:dirname(node)+':'+join(home,'.local','bin')+':/usr/local/bin:/usr/bin:/bin',CLAUDE_COMMAND:claude,CODEX_COMMAND:codex,...opencode&&{OPENCODE_COMMAND:opencode},BRIDGE_STATE_DIR:directory};
  return '[Unit]\nDescription=Codex Claude persistent agent bridge\nStartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\nType=simple\nWorkingDirectory='+quote(repo).slice(1,-1)+'\nExecStart='+quote(node,true)+' '+quote(join(repo,'src','service.js'),true)+'\n'+Object.entries(env).map(([k,v])=>'Environment='+quote(k+'='+v)).join('\n')+'\nUMask=0077\nKillMode=control-group\nTimeoutStopSec=30\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n';
 }
-export function installService({node=process.execPath,repo=resolve(dirname(fileURLToPath(import.meta.url)),'..'),home=homedir(),claude=process.env.CLAUDE_COMMAND||join(home,'.local','bin','claude'),codex=process.env.CODEX_COMMAND||join(home,'.local','bin','codex'),directory=stateDirectory()}={}){
+export function installService({node=process.execPath,repo=resolve(dirname(fileURLToPath(import.meta.url)),'..'),home=homedir(),claude=process.env.CLAUDE_COMMAND||join(home,'.local','bin','claude'),codex=process.env.CODEX_COMMAND||join(home,'.local','bin','codex'),opencode=process.env.OPENCODE_COMMAND||join(home,'.opencode','bin','opencode'),directory=stateDirectory()}={}){
  if(process.platform!=='linux')throw Error('Run installer in WSL/Linux');
  for(const path of [node,claude,codex])accessSync(path,constants.X_OK);
  const dir=join(home,'.config','systemd','user');mkdirSync(dir,{recursive:true});
- const path=join(dir,'agent-bridge.service'),text=serviceUnit({node,repo,home,claude,codex,directory});
+ const path=join(dir,'agent-bridge.service'),text=serviceUnit({node,repo,home,claude,codex,opencode,directory});
  if(!existsSync(path)||readFileSync(path,'utf8')!==text){
   if(existsSync(path))writeFileSync(path+'.backup-'+Date.now(),readFileSync(path),{mode:0o600});
   writeFileSync(path,text,{mode:0o600});
