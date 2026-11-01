@@ -1,4 +1,4 @@
-import { readFileSync,writeFileSync,mkdirSync,renameSync,existsSync,chmodSync,unlinkSync } from 'node:fs';
+import { readFileSync,writeFileSync,mkdirSync,renameSync,existsSync,chmodSync,unlinkSync,realpathSync,lstatSync } from 'node:fs';
 import { join,resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -8,7 +8,14 @@ function splitToml(text){
  const chunks=text.split(/(?=^[\t ]*\[[^\r\n]+\][\t ]*(?:#.*)?$)/m);
  return {before:chunks.filter(c=>target.test(c.split(/\r?\n/)[0])).join(''),rest:chunks.filter(c=>!target.test(c.split(/\r?\n/)[0])).join('')};
 }
+// A symlinked config (dotfiles) is written through to its target: renaming over the link would detach it from its repository.
+function realTarget(path){
+ try{return realpathSync(path);}
+ catch(error){if(error.code==='ENOENT'&&!isLink(path))return path;throw Error('Configuration is a broken symlink, refusing to replace it: '+path);}
+}
+const isLink=path=>{try{return lstatSync(path).isSymbolicLink();}catch{return false;}};
 function atomic(path,content,expected){
+ path=realTarget(path);
  if(existsSync(path)&&readFileSync(path,'utf8')!==expected)throw Error('Configuration changed concurrently: '+path);
  const temp=path+'.agent-bridge-'+randomUUID();writeFileSync(temp,content,{mode:0o600});renameSync(temp,path);
 }

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync,writeFileSync,readFileSync,rmSync,mkdirSync,existsSync,chmodSync } from 'node:fs';
+import { mkdtempSync,writeFileSync,readFileSync,rmSync,mkdirSync,existsSync,chmodSync,symlinkSync,lstatSync,renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { configureClients,rollbackClients,bridgeConfig,apply } from '../scripts/configure-clients.js';
@@ -69,6 +69,19 @@ test('registration adds the bridge to opencode and preserves unrelated config',t
  assert.match(readFileSync(f.codex,'utf8'),/args = \["\/repo\/src\/launch\.js","codex"\]/);
  const backup=readFileSync(result.backup,'utf8');assert.ok(!backup.includes('do-not-backup'));assert.ok(!backup.includes('superpowers'));
  assert.equal(configureClients({home:f.home,platform:'linux',node:'/node',repo:'/repo'}).unchanged,true);
+});
+test('a symlinked config is written through to its target and stays a link, through rollback too; a broken link is refused',t=>{
+ const f=fixture(t),dotfiles=join(f.home,'dotfiles');mkdirSync(dotfiles);
+ for(const p of [f.oc,f.claude]){const real=join(dotfiles,p.split('/').pop());renameSync(p,real);symlinkSync(real,p);}
+ const result=configureClients({home:f.home,platform:'linux',node:'/node',repo:'/repo'});
+ for(const p of [f.oc,f.claude])assert.ok(lstatSync(p).isSymbolicLink(),p+' was replaced by a regular file');
+ assert.ok(readJson(join(dotfiles,'opencode.json')).mcp.servers.agentbridge);assert.ok(readJson(join(dotfiles,'.claude.json')).mcpServers['codex-bridge']);
+ rollbackClients(result.backup);
+ assert.ok(lstatSync(f.oc).isSymbolicLink());assert.equal(readJson(join(dotfiles,'opencode.json')).mcp.servers.agentbridge,undefined);
+ const g=fixture(t,{opencode:null});symlinkSync(join(g.home,'missing.json'),join(g.home,'.config','opencode','opencode.json'));
+ const toml=readFileSync(g.codex,'utf8');
+ assert.throws(()=>configureClients({home:g.home,platform:'linux',node:'/node',repo:'/repo'}),/broken symlink/);
+ assert.equal(readFileSync(g.codex,'utf8'),toml,'the earlier writes were unwound');assert.ok(lstatSync(join(g.home,'.config','opencode','opencode.json')).isSymbolicLink());
 });
 test('registration creates the opencode config when none exists and honours the config directory override',t=>{
  const f=fixture(t,{opencode:null}),xdg=join(f.home,'xdg');
