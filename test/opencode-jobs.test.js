@@ -20,7 +20,7 @@ test('adapter streams progress, records the session and completes', async () => 
   const jobs = new OpenCodeJobs({ client, service });
   const job = jobs.start({ prompt: 'review', cwd, level: 'edit' });
   await tick();
-  assert.deepEqual(jobs.status(job.id).openCode, { sessionId: 's1', endpoint: 'http://127.0.0.1:4096' });
+  assert.deepEqual(jobs.status(job.id).openCode, { sessionId: 's1', endpoint: 'http://127.0.0.1:4096', interrupt: null });
   emit(delta('work'));
   emit(delta('ing'));
   emit(ev('session.tool.input.started', { id: 't1', name: 'read' }));
@@ -30,6 +30,8 @@ test('adapter streams progress, records the session and completes', async () => 
   assert.equal(jobs.status(job.id).progress.text, 'working');
   assert.deepEqual(client.session.create.calls[0].permissions, levelRules('edit'));
   assert.deepEqual(client.session.create.calls[0].location, { directory: cwd });
+  assert.deepEqual(client.session.create.calls[0].metadata, { agentbridge: { level: 'edit' } });
+  assert.deepEqual(client.event.subscribe.calls[0], { signal: true, requestSignal: true });
   assert.deepEqual(client.session.prompt.calls[0], { sessionID: 's1', text: 'review' });
   emit(ended('working'));
   emit(succeeded);
@@ -52,7 +54,7 @@ test('the session is recorded before the prompt is sent', async () => {
   const jobs = new OpenCodeJobs(fakeOpenCode({ script: { 'session.prompt': () => { seen = jobs.list()[0].openCode; return {}; } } }));
   jobs.start({ prompt: 'x', cwd });
   await tick();
-  assert.deepEqual(seen, { sessionId: 's1', endpoint: 'http://127.0.0.1:4096' });
+  assert.deepEqual(seen, { sessionId: 's1', endpoint: 'http://127.0.0.1:4096', interrupt: null });
   await jobs.shutdown();
 });
 
@@ -144,6 +146,8 @@ test('cancel interrupts the session and cannot be overwritten by a late result',
   emit(delta('partial'));
   await tick();
   assert.equal(jobs.cancel(job.id).status, 'cancelled');
+  await tick();
+  assert.deepEqual(client.session.interrupt.calls, [{ sessionID: 's1' }]);
   // Late events arrive while the interrupt is still in flight.
   emit(delta('late'));
   emit(ended('late'));
@@ -156,6 +160,7 @@ test('cancel interrupts the session and cannot be overwritten by a late result',
   assert.equal(result.result, null);
   assert.equal(result.progress.text, 'partial');
   assert.ok(result.finishedAt);
+  assert.equal(result.openCode.interrupt, 'confirmed');
   assert.deepEqual(client.session.interrupt.calls, [{ sessionID: 's1' }]);
   await jobs.shutdown();
   assert.equal(open(), 0);
@@ -239,19 +244,167 @@ test('oversized messages and excess concurrency are bounded', async () => {
 });
 
 test('resume prompts the recorded session instead of creating one', async () => {
-  const { client, service, emit } = fakeOpenCode();
+  const marked = level => ({ 'session.get': ({ sessionID }) => ({ id: sessionID, metadata: { agentbridge: { level } } }) });
+  const { client, service, emit } = fakeOpenCode({ script: marked('build') });
   const jobs = new OpenCodeJobs({ client, service });
   const job = jobs.start({ prompt: 'again', cwd, sessionId: 's1', level: 'build', model: 'anthropic/claude-sonnet-4.5' });
   assert.equal(job.openCode.sessionId, 's1');
   assert.throws(() => jobs.start({ prompt: 'x', cwd, sessionId: 's1' }), /active turn/);
   await tick();
   assert.equal(client.session.create.calls.length, 0);
-  assert.deepEqual(client.session.update.calls[0], { sessionID: 's1', permissions: levelRules('build') });
+  assert.equal(client.config.get.calls.length, 0);
+  assert.deepEqual(client.session.get.calls[0], { sessionID: 's1' });
   assert.deepEqual(client.session.switchModel.calls[0], { sessionID: 's1', model: { providerID: 'anthropic', id: 'claude-sonnet-4.5' } });
   assert.equal(client.session.prompt.calls[0].sessionID, 's1');
   emit(succeeded);
   assert.equal((await jobs.wait(job.id)).status, 'completed');
   await jobs.shutdown();
+  // The client exposes no permission rewrite to the adapter at all.
+  assert.equal(client.session.update, undefined);
+});
+
+test('resume refuses sessions the bridge did not create, and a different level', async () => {
+  for (const [script, level, pattern] of [
+    [{ 'session.get': ({ sessionID }) => ({ id: sessionID }) }, 'read-only', /not created by the bridge/],
+    [{ 'session.get': ({ sessionID }) => ({ id: sessionID, metadata: { other: true } }) }, 'read-only', /not created by the bridge/],
+    [{ 'session.get': ({ sessionID }) => ({ id: sessionID, metadata: { agentbridge: { level: 'read-only' } } }) }, 'build', /created at level "read-only"/],
+  ]) {
+    const fake = fakeOpenCode({ script });
+    const jobs = new OpenCodeJobs(fake);
+    const result = await jobs.wait(jobs.start({ prompt: 'x', cwd, sessionId: 'user-session', level }).id);
+    assert.equal(result.status, 'failed');
+    assert.match(result.error, pattern);
+    assert.equal(fake.client.session.prompt.calls.length, 0);
+    assert.equal(fake.stats.opened, 0);
+  }
+});
+
+test('a cancel during the prompt lets the prompt land before interrupting', async () => {
+  const order = [], prompted = gate();
+  const { client, service } = fakeOpenCode({ script: {
+    'session.prompt': async () => { await prompted.promise; order.push('prompt'); return {}; },
+    'session.interrupt': () => { order.push('interrupt'); return {}; },
+  } });
+  const jobs = new OpenCodeJobs({ client, service, drainMs: 20 });
+  const job = jobs.start({ prompt: 'x', cwd });
+  await tick();
+  assert.equal(client.session.prompt.calls.length, 1);
+  jobs.cancel(job.id);
+  await tick();
+  assert.deepEqual(order, []);
+  prompted.resolve();
+  assert.equal((await jobs.wait(job.id)).status, 'cancelled');
+  assert.deepEqual(order, ['prompt', 'interrupt']);
+  await jobs.shutdown();
+  // A prompt that never answers is waited for only closeMs.
+  const stuck = fakeOpenCode({ script: { 'session.prompt': () => new Promise(() => {}) } });
+  const other = new OpenCodeJobs({ ...stuck, closeMs: 20 });
+  const late = other.start({ prompt: 'x', cwd });
+  await tick();
+  other.cancel(late.id);
+  await other.wait(late.id);
+  assert.deepEqual(stuck.client.session.interrupt.calls, [{ sessionID: 's1' }]);
+  await other.shutdown();
+});
+
+test('an unconfirmed interrupt is recorded and the stream keeps answering until the turn ends', async () => {
+  const { client, service, emit, open } = fakeOpenCode({ script: { 'session.interrupt': () => { throw Error('connection refused'); } } });
+  const jobs = new OpenCodeJobs({ client, service });
+  const job = jobs.start({ prompt: 'x', cwd });
+  await tick();
+  jobs.cancel(job.id);
+  const result = await jobs.wait(job.id);
+  assert.equal(result.status, 'cancelled');
+  assert.equal(result.openCode.interrupt, 'unconfirmed');
+  assert.ok(jobs.events(job.id).events.some(e => e.type === 'interrupt_unconfirmed' && e.sessionId === 's1'));
+  // shutdown() waits for the still-running turn, answering its requests meanwhile.
+  let shut = false;
+  const closing = jobs.shutdown().then(() => { shut = true; });
+  await tick();
+  assert.equal(shut, false);
+  assert.equal(open(), 1);
+  emit(asked('r9', 'shell'));
+  await tick();
+  assert.deepEqual(client.permission.reply.calls[0], { sessionID: 's1', requestID: 'r9', decision: 'reject' });
+  emit(ev('session.execution.succeeded'));
+  await closing;
+  assert.equal(open(), 0);
+  // Without a terminal event the wait is bounded by drainMs.
+  const quiet = fakeOpenCode({ script: { 'session.interrupt': () => { throw Error('down'); } } });
+  const other = new OpenCodeJobs({ ...quiet, drainMs: 20 });
+  const stuck = other.start({ prompt: 'x', cwd });
+  await tick();
+  other.cancel(stuck.id);
+  await other.wait(stuck.id);
+  await other.shutdown();
+  assert.equal(quiet.open(), 0);
+});
+
+test('the fake models the real stream: late subscribers miss events, return() waits, abort closes', async () => {
+  const { client, emit, open } = fakeOpenCode();
+  emit(delta('before anyone listens'));
+  const plain = client.event.subscribe({})[Symbol.asyncIterator]();
+  assert.equal((await plain.next()).value.type, 'server.connected');
+  const pending = plain.next();
+  let returned = false;
+  const closing = plain.return().then(() => { returned = true; });
+  await tick();
+  assert.equal(returned, false);
+  assert.equal(open(), 1);
+  emit(delta('after'));
+  assert.equal((await pending).value.data.delta, 'after');
+  await closing;
+  assert.equal(open(), 0);
+  // A signal in the second argument is ignored, as by OpenCode.make's client.
+  const ignored = new AbortController();
+  const deaf = client.event.subscribe({}, { signal: ignored.signal })[Symbol.asyncIterator]();
+  await deaf.next();
+  const stillWaiting = deaf.next();
+  ignored.abort();
+  await tick();
+  assert.equal(open(), 1);
+  emit(null);
+  assert.equal((await stillWaiting).done, true);
+  const controller = new AbortController();
+  const aborted = client.event.subscribe({ signal: controller.signal })[Symbol.asyncIterator]();
+  await aborted.next();
+  const waiting = aborted.next();
+  controller.abort();
+  await assert.rejects(waiting, /aborted/);
+  assert.equal(open(), 0);
+});
+
+test('the real client stream closes on shutdown against a silent server', { timeout: 15000 }, async () => {
+  const { createServer } = await import('node:http');
+  const { OpenCode } = await import('@opencode/client');
+  let closed;
+  const disconnected = new Promise(resolve => { closed = resolve; });
+  const server = createServer((req, res) => {
+    assert.equal(req.url.split('?')[0], '/api/event');
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"type":"server.connected","data":{}}\n\n');
+    res.write(': heartbeat\n\n');
+    req.on('close', closed);
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const real = OpenCode.make({ baseUrl: `http://127.0.0.1:${server.address().port}` });
+    const fake = fakeOpenCode();
+    fake.client.event = real.event;
+    // The fake interrupt's event cannot reach the real stream, so drainMs bounds the wait for it.
+    const jobs = new OpenCodeJobs({ ...fake, closeMs: 60_000, drainMs: 20 });
+    const job = jobs.start({ prompt: 'x', cwd });
+    while (!fake.client.session.prompt.calls.length) await tick();
+    jobs.cancel(job.id);
+    await jobs.wait(job.id);
+    const started = Date.now();
+    await jobs.shutdown();
+    assert.ok(Date.now() - started < 5000, 'close waited for a timeout instead of aborting the request');
+    await disconnected;
+  } finally {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
 });
 
 test('the user configuration bounds the level, and an impossible one fails the job cleanly', async () => {

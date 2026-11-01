@@ -9,10 +9,18 @@ const now = () => new Date().toISOString();
 const bounded = (value, limit = 4000) => String(value ?? '').slice(0, limit);
 const settledWithin = (promise, ms) => {
   let timer;
-  return Promise.race([Promise.resolve(promise).catch(() => {}), new Promise(resolve => { timer = setTimeout(resolve, ms); timer.unref?.(); })]).finally(() => clearTimeout(timer));
+  return Promise.race([Promise.resolve(promise).catch(() => {}), new Promise(resolve => { timer = setTimeout(resolve, ms); })]).finally(() => clearTimeout(timer));
 };
 // The endpoint is persisted and shown to callers, so its credentials are stripped.
 const publicUrl = url => { const u = new URL(url); u.username = u.password = u.search = u.hash = ''; return u.href.replace(/\/$/, ''); };
+// Whether an attempt settled successfully within ms; a timeout counts as failure.
+const confirmed = (fn, ms) => {
+  let timer;
+  return Promise.race([(async () => fn())().then(() => true, () => false), new Promise(resolve => { timer = setTimeout(resolve, ms, false); })]).finally(() => clearTimeout(timer));
+};
+const TERMINAL = /^session\.execution\.(succeeded|failed|interrupted)$/;
+// Metadata key marking sessions this bridge created; only those may be resumed.
+const MARK = 'agentbridge';
 const MODEL = /^([a-zA-Z0-9._-]{1,64})\/([a-zA-Z0-9._:/-]{1,192})$/;
 
 /** One OpenCode session turn per job, driven over the shared local service's HTTP API. */
@@ -20,12 +28,12 @@ export class OpenCodeJobs {
   constructor({
     client, service = Service,
     timeoutMs = 3_600_000, maxOutputBytes = 4_000_000,
-    maxEvents = 256, maxConcurrent = 4, maxJobs = 100, connectMs = 10_000, closeMs = 3000, lingerMs = 5000,
+    maxEvents = 256, maxConcurrent = 4, maxJobs = 100, connectMs = 10_000, closeMs = 3000, lingerMs = 5000, drainMs = 30_000,
   } = {}) {
-    for (const value of [timeoutMs, maxOutputBytes, maxEvents, maxConcurrent, maxJobs, connectMs, closeMs, lingerMs]) {
+    for (const value of [timeoutMs, maxOutputBytes, maxEvents, maxConcurrent, maxJobs, connectMs, closeMs, lingerMs, drainMs]) {
       if (!Number.isSafeInteger(value) || value < 1) throw new Error('Limits must be positive integers');
     }
-    Object.assign(this, { client, service, timeoutMs, maxOutputBytes, maxEvents, maxConcurrent, maxJobs, connectMs, closeMs, lingerMs });
+    Object.assign(this, { client, service, timeoutMs, maxOutputBytes, maxEvents, maxConcurrent, maxJobs, connectMs, closeMs, lingerMs, drainMs });
     this.jobs = new Map();
     // Requests already answered, across jobs, so a redelivered request is not replied to twice.
     this.answered = new Set();
@@ -60,12 +68,13 @@ export class OpenCodeJobs {
       startedAt: now(), cwd, level, sessionId: sessionId ?? null, result: null, error: null,
       progress: { phase: 'starting', text: '', textTruncated: false, updatedAt: now() },
       permissionDenials: [], usage: null, costUsd: null,
-      openCode: { sessionId: sessionId ?? null, endpoint: null },
+      openCode: { sessionId: sessionId ?? null, endpoint: null, interrupt: null },
     };
     const record = {
       view, controller: new AbortController(), events: [], sequence: 0, settled: false,
       prompted: false, ended: false, replies: new Set(), streamed: new Set(), message: null, parts: new Map(),
-      live: Promise.withResolvers(), finish: Promise.withResolvers(),
+      live: Promise.withResolvers(), finish: Promise.withResolvers(), drain: Promise.withResolvers(),
+      subscription: new AbortController(),
     };
     record.live.promise.catch(() => {});
     record.finish.promise.catch(() => {});
@@ -87,15 +96,22 @@ export class OpenCodeJobs {
       const endpoint = await step(this.service.ensure());
       const client = record.client = this.client ?? OpenCode.make({ baseUrl: endpoint.url, headers: this.service.headers(endpoint) });
       view.openCode.endpoint = publicUrl(endpoint.url);
-      const entries = await step(client.config.get({ location: { directory: view.cwd } }));
-      if (!Array.isArray(entries)) throw new Error('OpenCode returned an invalid configuration');
-      const permissions = levelRules(request.level, { config: entries.flatMap(entry => entry?.info?.permissions ?? []) });
       let sessionID = request.sessionId;
       if (sessionID) {
-        await step(client.session.update({ sessionID, permissions }));
+        // A resumed session keeps the rules it was created with; its permissions are never rewritten.
+        const mark = (await step(client.session.get({ sessionID })))?.metadata?.[MARK];
+        if (!mark || typeof mark !== 'object') throw new Error('Session was not created by the bridge, so it cannot be resumed by it');
+        if (mark.level !== request.level)
+          throw new Error(`Session was created at level "${bounded(mark.level, 32)}"; resume it at that level or start a new job`);
         if (request.model) await step(client.session.switchModel({ sessionID, model: request.model }));
       } else {
-        const session = await step(client.session.create({ location: { directory: view.cwd }, ...(request.model ? { model: request.model } : {}), permissions }));
+        const entries = await step(client.config.get({ location: { directory: view.cwd } }));
+        if (!Array.isArray(entries)) throw new Error('OpenCode returned an invalid configuration');
+        const permissions = levelRules(request.level, { config: entries.flatMap(entry => entry?.info?.permissions ?? []) });
+        const session = await step(client.session.create({
+          location: { directory: view.cwd }, ...(request.model ? { model: request.model } : {}),
+          permissions, metadata: { [MARK]: { level: request.level } },
+        }));
         sessionID = session?.id;
         if (typeof sessionID !== 'string' || !/^[a-zA-Z0-9._-]{1,128}$/.test(sessionID)) throw new Error('OpenCode returned an invalid session');
       }
@@ -103,30 +119,45 @@ export class OpenCodeJobs {
       view.progress.phase = 'running';
       this.event(record, 'session', { sessionId: sessionID });
       record.owned = new Set([sessionID]);
-      // Subscribe before prompting; server.connected marks the subscription live.
-      record.stream = client.event.subscribe({})[Symbol.asyncIterator]();
+      // Subscribe before prompting; server.connected marks the subscription live. The abort signal is what
+      // closes the stream. OpenCode.make's shared stream reads it from the first argument; the raw generated
+      // client reads it from the second, and there return() waits for the pending next().
+      const { signal: closer } = record.subscription;
+      record.stream = client.event.subscribe({ signal: closer }, { signal: closer })[Symbol.asyncIterator]();
       this.pump(record, client, record.stream);
       let connect;
       const connected = new Promise((_, reject) => { connect = setTimeout(() => reject(new Error('OpenCode event stream did not connect')), this.connectMs); });
       await step(Promise.race([record.live.promise, connected])).finally(() => clearTimeout(connect));
       record.prompted = true;
-      await step(client.session.prompt({ sessionID, text: request.prompt }));
+      record.promptCall = (async () => client.session.prompt({ sessionID, text: request.prompt }))();
+      await step(record.promptCall);
       record.outcome = await step(record.finish.promise);
     } catch (error) {
       if (!signal.aborted) record.outcome = { status: 'failed', error: bounded(error?.message || error) };
     } finally {
       clearTimeout(timer);
-      // Interrupting also ends any permission request we failed to answer.
-      if (record.prompted && !record.ended)
-        await settledWithin((async () => record.client.session.interrupt({ sessionID: view.sessionId }))(), this.closeMs);
+      // Interrupting also ends any permission request we failed to answer. A prompt still in flight
+      // could start its turn after the interrupt, so it is allowed to land first.
+      if (record.prompted && !record.ended) await settledWithin(record.promptCall, this.closeMs);
+      if (record.prompted && !record.ended) {
+        const ok = await confirmed(() => record.client.session.interrupt({ sessionID: view.sessionId }), this.closeMs);
+        view.openCode.interrupt = ok ? 'confirmed' : 'unconfirmed';
+        if (!ok) this.event(record, 'interrupt_unconfirmed', { sessionId: view.sessionId });
+      }
       if (!signal.aborted && record.outcome) Object.assign(view, record.outcome);
       view.finishedAt = now();
       view.progress.phase = view.status;
       view.progress.updatedAt = now();
       record.settled = true;
       this.event(record, 'finished', { status: view.status });
-      // Keep answering late permission requests briefly; shutdown() closes sooner.
-      if (record.stream) { record.linger = setTimeout(() => this.close(record), this.lingerMs); record.linger.unref?.(); }
+      // After an unclean exit the turn may still run: keep answering its requests until it ends or drainMs passes.
+      if (!record.prompted || record.ended) record.drain.resolve();
+      else {
+        const bound = setTimeout(record.drain.resolve, this.drainMs);
+        record.drain.promise.then(() => clearTimeout(bound));
+      }
+      // Then keep answering late requests briefly; shutdown() closes once drained.
+      if (record.stream) record.drain.promise.then(() => { record.linger = setTimeout(() => this.close(record), this.lingerMs); record.linger.unref?.(); });
     }
   }
 
@@ -141,6 +172,7 @@ export class OpenCodeJobs {
         if (!record.owned.has(data.sessionID)) continue;
         // Answered before any other check: an unanswered request hangs the delegate.
         if (event.type === 'permission.asked') this.answer(record, client, data);
+        if (record.prompted && data.sessionID === view.sessionId && TERMINAL.test(event.type)) { record.ended = true; record.drain.resolve(); }
         if (record.settled || signal.aborted || !record.prompted || data.sessionID !== view.sessionId) continue;
         if (Buffer.byteLength(JSON.stringify(event), 'utf8') > this.maxOutputBytes) {
           this.stop(record, 'failed', 'OpenCode output exceeded the configured byte limit');
@@ -152,6 +184,8 @@ export class OpenCodeJobs {
     } catch (error) {
       record.live.reject(error);
       record.finish.reject(error);
+    } finally {
+      record.drain.resolve();
     }
   }
 
@@ -191,8 +225,7 @@ export class OpenCodeJobs {
       const { input, output, reasoning, cache } = data.tokens ?? {};
       view.usage = { input, output, reasoning, cache: { read: cache?.read, write: cache?.write } };
       view.costUsd = typeof data.cost === 'number' ? data.cost : null;
-    } else if (/^session\.execution\.(succeeded|failed|interrupted)$/.test(type)) {
-      record.ended = true;
+    } else if (TERMINAL.test(type)) {
       view.progress.phase = 'finishing';
       record.finish.resolve(type.endsWith('succeeded') ? { status: 'completed', result: record.result ?? '' }
         : type.endsWith('failed') ? { status: 'failed', error: bounded(data.error?.message || 'OpenCode execution failed') }
@@ -220,11 +253,12 @@ export class OpenCodeJobs {
     if (record.events.length > this.maxEvents) record.events.shift();
   }
 
-  /** Closes the event stream once pending replies land. return() can block mid-next(), so both waits are bounded. */
+  /** Closes the event stream once pending replies land: aborting the request ends the generator; return() is a fallback. */
   close(record) {
     return record.closing ??= (async () => {
       clearTimeout(record.linger);
       await settledWithin(Promise.allSettled([...record.replies]), this.closeMs);
+      record.subscription.abort();
       if (record.stream) await settledWithin((async () => record.stream.return?.())(), this.closeMs);
     })();
   }
@@ -269,6 +303,7 @@ export class OpenCodeJobs {
     this.closing = true;
     for (const record of this.jobs.values()) this.stop(record, 'cancelled');
     await Promise.all([...this.jobs.values()].map(record => record.done));
+    await Promise.all([...this.jobs.values()].map(record => record.drain.promise));
     await Promise.all([...this.jobs.values()].map(record => this.close(record)));
   }
 }
