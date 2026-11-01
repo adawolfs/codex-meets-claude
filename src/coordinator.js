@@ -141,10 +141,20 @@ export class Coordinator {
         outcome={status:'failed',error:'Provider ended without a terminal result'};
       const {worktree,...result}=outcome;
       // Settled while the row is still running, so cleanup refuses throughout.
-      this.store.update(record.id,{...result,...(record.worktree?{worktree:this.settle(record,result)}:{}),finishedAt:timestamp(),progress:{phase:outcome.status,text:'',updatedAt:timestamp()}});
+      this.finish(record.id,{...result,...(record.worktree?{worktree:this.settle(record,result)}:{}),finishedAt:timestamp(),progress:{phase:outcome.status,text:'',updatedAt:timestamp()}});
       this.store.prune();
     } catch(error){this.fail(error);}
     finally {this.active.delete(record.id);queueMicrotask(()=>this.pump());}
+  }
+  // An oversized terminal view degrades rather than stopping the service: first the worktree's file list goes, then the
+  // result is cut. Its status, error and worktree identity always land.
+  finish(id,patch){
+    const trims=[p=>p,p=>p.worktree?{...p,worktree:{...p.worktree,changedFiles:[],truncated:true}}:p,
+      p=>typeof p.result==='string'?{...p,result:p.result.slice(0,1_000_000)+'\n[result truncated: it exceeded the storage limit]'}:p];
+    for(let i=0,next=patch;;i++){
+      next=trims[i](next);
+      try{return this.store.update(id,next);}catch(error){if(error.code!=='TOO_LARGE'||i===trims.length-1)throw error;}
+    }
   }
   // A worktree job runs in its worktree, at the same subdirectory it was started from.
   prepare(record){
@@ -161,7 +171,7 @@ export class Coordinator {
   settle(record,{status,openCode}){
     const row=record.worktree,report={id:row.id,branch:row.branch,path:row.path,changedFiles:null,removed:false};
     try{
-      const {dirty,changedFiles}=worktreeStatus(row.path,{branch:row.branch});report.changedFiles=changedFiles;
+      const {dirty,changedFiles,changedCount,truncated}=worktreeStatus(row.path,{branch:row.branch});Object.assign(report,{changedFiles,changedCount,truncated});
       const held=(openCode??this.store.record(record.id).view.openCode)?.interrupt==='unconfirmed';
       if(dirty||held||status==='interrupted'||this.store.worktreeOwners(row).some(o=>o.id!==record.id))return report;
       removeWorktree(row.path,{branch:row.branch,repo:row.project});this.store.deleteWorktree(row.id);report.removed=true;

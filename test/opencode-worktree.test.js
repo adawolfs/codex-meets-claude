@@ -207,16 +207,47 @@ test('ignored files a delegate writes count as changes; ignored files present at
   assert.equal(clean.worktree.removed,true,JSON.stringify(clean.worktree));
   const kept=await run(f,repo,{write:'out/report.txt'});
   assert.equal(kept.worktree.removed,false);
-  assert.deepEqual(kept.worktree.changedFiles,['out/report.txt']);
+  assert.deepEqual(kept.worktree.changedFiles,['out/'],'an ignored directory is reported whole');
   await assert.rejects(()=>f.c.cleanup('opencode',{worktreeId:kept.worktree.id}),/discard/);
   assert.equal(existsSync(join(kept.worktree.path,'out','report.txt')),true);
+});
+
+test('thousands of ignored and untracked files keep the report small, the list lean and the service up',async t=>{
+  const repo=makeRepo(t);
+  writeFileSync(join(repo,'.gitignore'),'node_modules/\n');git(repo,'add','.');git(repo,'commit','-qm','ignore');
+  let fatal=null;const f=setup(t,{onFatal:e=>{fatal=e;}});
+  // An `npm ci` in the tree: thousands of ignored files with long paths, plus many untracked ones outside any ignore.
+  f.c.runner=async(p,args)=>{
+    for(let i=0;i<3000;i++){const d=join(args.cwd,'node_modules','pkg-'+i%50,'lib'.repeat(20));mkdirSync(d,{recursive:true});writeFileSync(join(d,'file-'+i+'.js'),'x');}
+    mkdirSync(join(args.cwd,'gen'));for(let i=0;i<1500;i++)writeFileSync(join(args.cwd,'gen','out-'+i+'.txt'),'x');
+    return {status:'completed',result:'ok'};
+  };
+  const view=await run(f,repo);
+  assert.equal(fatal,null);assert.equal(view.status,'completed');assert.equal(view.worktree.removed,false);
+  assert.equal(view.worktree.changedFiles.length,200);assert.equal(view.worktree.truncated,true);
+  assert.equal(view.worktree.changedCount,1501,'node_modules/ counts once, each untracked file once');
+  assert.ok(view.worktree.changedFiles.includes('gen/out-0.txt'));
+  rmSync(join(view.worktree.path,'gen'),{recursive:true});
+  assert.deepEqual(worktreeStatus(view.worktree.path).changedFiles,['node_modules/']);
+  const [summary]=f.c.list('opencode',{}).jobs;
+  assert.equal(summary.worktree.changedFiles,undefined);assert.equal(summary.worktree.changedCount,1501);assert.equal(summary.worktree.id,view.worktree.id);
+});
+
+test('an oversized terminal view is trimmed and stored instead of stopping the service',async t=>{
+  const repo=makeRepo(t);let fatal=null;const f=setup(t,{onFatal:e=>{fatal=e;}});
+  f.c.runner=async(p,args)=>{writeFileSync(join(args.cwd,'a.js'),'x');return {status:'completed',result:'r'.repeat(4_600_000)};};
+  const view=await run(f,repo);
+  assert.equal(fatal,null);assert.equal(f.c.closing,false);
+  assert.equal(view.status,'completed');assert.match(view.result,/result truncated/);assert.ok(view.result.length<1_100_000);
+  assert.deepEqual(view.worktree.changedFiles,[]);assert.equal(view.worktree.truncated,true);assert.equal(view.worktree.changedCount,1);
+  assert.equal(existsSync(view.worktree.path),true,'the delegate\'s work is kept');
 });
 
 test('a rename reports both its old and new path',async t=>{
   const repo=makeRepo(t),root=temp(t,'bridge-wt-root-');
   const tree=await createWorktree({project:repo,jobId:'j2',root});
   git(tree.path,'mv','README','RENAMED');
-  assert.deepEqual(worktreeStatus(tree.path),{dirty:true,changedFiles:['README','RENAMED']});
+  assert.deepEqual(worktreeStatus(tree.path),{dirty:true,changedFiles:['README','RENAMED'],changedCount:2,truncated:false});
 });
 
 test('a failed creation keeps the row when its partial tree cannot be removed',async t=>{
@@ -339,9 +370,9 @@ test('removeWorktree refuses a dirty tree without discard and always takes the b
   const repo=makeRepo(t),root=temp(t,'bridge-wt-root-');
   const tree=await createWorktree({project:repo,jobId:'j1',root});
   assert.deepEqual(tree,{path:join(root,'j1'),branch:'bridge/j1'});
-  assert.deepEqual(worktreeStatus(tree.path),{dirty:false,changedFiles:[]});
+  assert.deepEqual(worktreeStatus(tree.path),{dirty:false,changedFiles:[],changedCount:0,truncated:false});
   writeFileSync(join(tree.path,'README'),'edit\n');
-  assert.deepEqual(worktreeStatus(tree.path),{dirty:true,changedFiles:['README']});
+  assert.deepEqual(worktreeStatus(tree.path),{dirty:true,changedFiles:['README'],changedCount:1,truncated:false});
   assert.throws(()=>removeWorktree(tree.path),/discard/);
   assert.equal(existsSync(tree.path),true);
   removeWorktree(tree.path,{discard:true});

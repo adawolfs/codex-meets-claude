@@ -69,7 +69,7 @@ export class Store {
     const next = { ...row.view };
     for (const key of allowed) if (Object.hasOwn(patch, key)) next[key] = patch[key];
     const body = JSON.stringify(next);
-    if (Buffer.byteLength(body) > 4_500_000) throw Error('Job result exceeds storage limit');
+    if (Buffer.byteLength(body) > 4_500_000) throw Object.assign(Error('Job result exceeds storage limit'), { code: 'TOO_LARGE' });
     this.db.prepare('UPDATE jobs SET status=?,view=?,finished=? WHERE id=?').run(next.status, body, next.finishedAt ?? null, id);
     return next;
   }
@@ -84,8 +84,10 @@ export class Store {
     const { after, limit } = pageArgs(options);
     const rows = this.db.prepare('SELECT seq,view FROM jobs WHERE provider=? AND seq>? ORDER BY seq LIMIT ?').all(provider, after, limit + 1);
     const jobs = rows.slice(0, limit).map(r => {
-      const { result, progress, permissionDenials, ...summary } = JSON.parse(r.view);
-      return { ...summary, progress: progress ? { phase: progress.phase, updatedAt: progress.updatedAt } : undefined,
+      const { result, progress, permissionDenials, worktree, ...summary } = JSON.parse(r.view);
+      // A worktree's file list stays in status; the summary keeps its count.
+      const { changedFiles, ...tree } = worktree ?? {};
+      return { ...summary, ...(worktree ? { worktree: tree } : {}), progress: progress ? { phase: progress.phase, updatedAt: progress.updatedAt } : undefined,
         error: summary.error?.slice(0, 1000) ?? null };
     });
     return { jobs, nextCursor: rows[Math.min(rows.length, limit) - 1]?.seq ?? after, hasMore: rows.length > limit };
