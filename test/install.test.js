@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync,writeFileSync,readFileSync,rmSync,mkdirSync,existsSync,chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { configureClients,rollbackClients,bridgeConfig } from '../scripts/configure-clients.js';
-import { serviceUnit } from '../scripts/install-service.js';
+import { configureClients,rollbackClients,bridgeConfig,apply } from '../scripts/configure-clients.js';
+import { serviceUnit,checkOpenCode } from '../scripts/install-service.js';
 test('configuration update and rollback preserve unrelated edits and never copy credentials',t=>{
  const home=mkdtempSync(join(tmpdir(),'bridge-config-'));t.after(()=>rmSync(home,{recursive:true,force:true}));
  mkdirSync(join(home,'.codex'));writeFileSync(join(home,'.codex','config.toml'),'model = "keep"\n[mcp_servers.claude-bridge]\ncommand = "old"\n[mcp_servers.claude-bridge.env]\nCLAUDE_COMMAND="old-cli"\n[other]\nvalue=1\n');
@@ -158,4 +158,31 @@ test('the unit carries OPENCODE_COMMAND when given and stays valid without it',(
  assert.match(serviceUnit({...a,opencode:'/home/a/.opencode/bin/opencode'}),/Environment="OPENCODE_COMMAND=\/home\/a\/\.opencode\/bin\/opencode"/);
  assert.doesNotMatch(serviceUnit(a),/OPENCODE_COMMAND/);
  assert.throws(()=>serviceUnit({...a,opencode:'/o\nbad'}));
+});
+test('a missing OpenCode binary warns on stderr and does not block, a present one is silent',()=>{
+ const seen=[];assert.equal(checkOpenCode('/no/such/opencode',m=>seen.push(m)),false);
+ assert.equal(seen.length,1);assert.match(seen[0],/\/no\/such\/opencode/);assert.match(seen[0],/OPENCODE_COMMAND/);
+ assert.equal(checkOpenCode(process.execPath,m=>seen.push(m)),true);assert.equal(seen.length,1);
+});
+test('a failed undo is reported with the files still modified and the backup, and does not stop the other undos',{skip:process.platform==='win32'||process.getuid?.()===0},t=>{
+ const d=mkdtempSync(join(tmpdir(),'bridge-apply-'));t.after(()=>{chmodSync(join(d,'a'),0o700);rmSync(d,{recursive:true,force:true});});
+ for(const n of ['a','b','c'])mkdirSync(join(d,n));
+ for(const n of ['a','b','c'])writeFileSync(join(d,n,'f'),'old-'+n);
+ // locking a/ while step 2 is prepared makes the undo of step 1 fail after step 1 succeeded
+ const steps=[{path:join(d,'a','f'),old:'old-a',next:'new-a'},{path:join(d,'b','f'),old:'old-b',get next(){chmodSync(join(d,'a'),0o500);return 'new-b';}},{path:join(d,'c','f'),old:'DIFFERENT',next:'new-c'}];
+ assert.throws(()=>apply(steps,'/backups/x.json'),e=>/changed concurrently/.test(e.message)&&e.message.includes(join(d,'a','f'))&&/EACCES/.test(e.message)&&e.message.includes('/backups/x.json')&&!e.message.includes(join(d,'b','f')));
+ assert.equal(readFileSync(join(d,'b','f'),'utf8'),'old-b');assert.equal(readFileSync(join(d,'a','f'),'utf8'),'new-a');
+});
+test('an undo that finds the file edited since leaves it and says so',t=>{
+ const d=mkdtempSync(join(tmpdir(),'bridge-apply-'));t.after(()=>rmSync(d,{recursive:true,force:true}));
+ for(const n of ['a','b','c'])writeFileSync(join(d,n),'old-'+n);
+ const steps=[{path:join(d,'a'),old:'old-a',next:'new-a'},{path:join(d,'b'),old:'old-b',get next(){writeFileSync(join(d,'a'),'user edit');return 'new-b';}},{path:join(d,'c'),old:'X',next:'n'}];
+ assert.throws(()=>apply(steps,'/b.json'),e=>/edited since, left as is/.test(e.message)&&e.message.includes(join(d,'a'))&&e.message.includes('/b.json'));
+ assert.equal(readFileSync(join(d,'a'),'utf8'),'user edit');assert.equal(readFileSync(join(d,'b'),'utf8'),'old-b');
+});
+test('a clean undo adds nothing to the error',t=>{
+ const d=mkdtempSync(join(tmpdir(),'bridge-apply-'));t.after(()=>rmSync(d,{recursive:true,force:true}));
+ writeFileSync(join(d,'a'),'old-a');writeFileSync(join(d,'c'),'old-c');
+ assert.throws(()=>apply([{path:join(d,'a'),old:'old-a',next:'new-a'},{path:join(d,'c'),old:'X',next:'n'}],'/b.json'),e=>!/Could not restore/.test(e.message));
+ assert.equal(readFileSync(join(d,'a'),'utf8'),'old-a');
 });

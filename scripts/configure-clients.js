@@ -13,11 +13,16 @@ function atomic(path,content,expected){
  const temp=path+'.agent-bridge-'+randomUUID();writeFileSync(temp,content,{mode:0o600});renameSync(temp,path);
 }
 // Writes in order; if one fails, undoes the earlier ones that still hold exactly what was written, so edits made since survive.
-function apply(steps){
-  const done=[];
+// Each undo is isolated, and the error names every file left modified and the backup, since those configs live outside this repository.
+export function apply(steps,backup){
+  const done=[],left=[];
   try{for(const step of steps){atomic(step.path,step.next,step.old);done.push(step);}}
   catch(error){
-   for(const step of done.reverse())try{if(readFileSync(step.path,'utf8')===step.next){if(step.old===null)unlinkSync(step.path);else atomic(step.path,step.old,step.next);}}catch{}
+   for(const step of done.reverse())try{
+    if(readFileSync(step.path,'utf8')!==step.next)left.push(step.path+' (edited since, left as is)');
+    else if(step.old===null)unlinkSync(step.path);else atomic(step.path,step.old,step.next);
+   }catch(undo){left.push(step.path+' ('+(undo.code||undo.message)+')');}
+   if(left.length)error.message+='\nCould not restore, still modified: '+left.join('; ')+'. Backup of the original entries: '+backup;
    throw error;
   }
 }
@@ -63,7 +68,7 @@ export function configureClients({home,xdg,platform=process.platform,node,repo,d
   mkdirSync(join(home,'.codex'),{recursive:true});mkdirSync(ocDir,{recursive:true});
   data.mcpServers??={};data.mcpServers['codex-bridge']=claude;
   oc.mcp??={};oc.mcp.servers??={};oc.mcp.servers[OC]=open;
-  apply([{path:codexPath,old:oldToml,next:parts.rest.replace(/\s*$/,'')+'\n\n'+block},{path:claudePath,old:oldJson,next:JSON.stringify(data,null,2)+'\n'},{path:ocPath,old:oldOc,next:dump(oc,oldOc??'')}]);
+  apply([{path:codexPath,old:oldToml,next:parts.rest.replace(/\s*$/,'')+'\n\n'+block},{path:claudePath,old:oldJson,next:JSON.stringify(data,null,2)+'\n'},{path:ocPath,old:oldOc,next:dump(oc,oldOc??'')}],backup);
   return {backup};
 }
 export function rollbackClients(backup){
@@ -81,7 +86,7 @@ export function rollbackClients(backup){
    if(b.beforeOpencode===null){delete servers[OC];if(!Object.keys(servers).length){delete oc.mcp.servers;if(!Object.keys(oc.mcp).length)delete oc.mcp;}}else servers[OC]=b.beforeOpencode;
    steps.push({path:b.opencodePath,old:ocText,next:dump(oc,ocText)});
   }
-  apply(steps);
+  apply(steps,backup);
   return {restored:true};
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){
