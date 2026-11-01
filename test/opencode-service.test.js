@@ -4,9 +4,12 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createServer as httpServer } from 'node:http';
+import { createServer as tcpServer } from 'node:net';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { startService, openCodeProbe } from '../src/service.js';
 import { ServiceClient } from '../src/client.js';
-import { PROVIDERS, surface, validateCall } from '../src/persistent-tools.js';
+import { PROVIDERS, surface, validateCall, staleRegistration } from '../src/persistent-tools.js';
 import { validateStart } from '../src/coordinator.js';
 import { OpenCodeJobs } from '../src/opencode-jobs.js';
 import { fakeOpenCode } from './fake-opencode.js';
@@ -115,10 +118,10 @@ test('diagnostics asks the injected probe and reports its answer', linux, async 
 
 const never = name => new Proxy({}, { get: (_, key) => { throw new Error(`${name} must not be used: ${String(key)}`); } });
 function probe({ discover = { url: 'http://x' }, info, ...rest } = {}) {
-  const calls = [];
+  const calls = [], signals = [];
   const service = { discover: async () => { calls.push('discover'); return discover; }, headers: () => undefined, get ensure() { throw new Error('diagnostics must never start a service'); } };
-  const connect = () => { calls.push('connect'); return { server: { info: async () => { calls.push('info'); return info(); } }, session: never('session'), config: never('config'), event: never('event') }; };
-  return { calls, run: openCodeProbe({ service, connect, ...rest }) };
+  const connect = () => { calls.push('connect'); return { server: { info: async options => { calls.push('info'); signals.push(options?.signal); return info(); } }, session: never('session'), config: never('config'), event: never('event') }; };
+  return { calls, signals, run: openCodeProbe({ service, connect, ...rest }) };
 }
 
 test('the opencode probe reports ready for any 2.x service and never starts one', async () => {
@@ -192,4 +195,92 @@ test('validateCall checks boolean arguments and rejects the ones a provider does
   assert.doesNotThrow(() => validateCall('opencode', 'cancel', { jobId: 'j', force: false }));
   assert.throws(() => validateCall('claude', 'cancel', { jobId: 'j', force: true }), /Unknown argument: force/);
   assert.throws(() => validateCall('codex', 'cancel', { jobId: 'j', force: true }), /Unknown argument: force/);
+});
+
+// launch.js asks diagnostics with a 1000 ms client timeout; the probe must stay clearly inside it.
+const READY_MS = 1000;
+async function withRegistered(t, handler) {
+  const state = mkdtempSync(join(tmpdir(), 'bridge-wedge-')), xdg = process.env.XDG_STATE_HOME;
+  const server = handler.http ? httpServer(handler.http) : tcpServer(() => {});
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  mkdirSync(join(state, 'opencode'));
+  writeFileSync(join(state, 'opencode', 'service.json'), JSON.stringify({ url: `http://127.0.0.1:${server.address().port}`, pid: process.pid, version: '2.2.5' }));
+  process.env.XDG_STATE_HOME = state;
+  t.after(() => { if (xdg === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = xdg; server.closeAllConnections?.(); server.close(); rmSync(state, { recursive: true, force: true }); });
+}
+
+test('the default probe budget is clearly below the launcher readiness timeout', async () => {
+  const p = probe({ info: () => new Promise(() => {}) });
+  const started = Date.now();
+  assert.equal((await p.run()).status, 'unreachable');
+  assert.ok(Date.now() - started < READY_MS * 0.8, `took ${Date.now() - started} ms`);
+  assert.equal(p.signals[0]?.aborted, true, 'the timed-out request is aborted, not left running');
+});
+
+test('a registered service that accepts connections but never answers does not slow diagnostics past the launcher timeout', linux, async t => {
+  await withRegistered(t, {});
+  const directory = mkdtempSync(join(tmpdir(), 'bridge-wedge-state-'));
+  const service = await startService({ directory, runner: async () => ({}) });
+  t.after(async () => { await service.close(); rmSync(directory, { recursive: true, force: true }); });
+  const started = Date.now();
+  const d = await new ServiceClient({ directory, timeoutMs: READY_MS }).call('claude', 'diagnostics');
+  assert.equal(d.opencode.status, 'unreachable');
+  assert.ok(Date.now() - started < READY_MS * 0.8, `took ${Date.now() - started} ms`);
+});
+
+test('a wedged opencode service does not stop any client from launching', linux, async t => {
+  await withRegistered(t, {});
+  const directory = mkdtempSync(join(tmpdir(), 'bridge-wedge-launch-'));
+  const service = await startService({ directory, runner: async () => ({}) });
+  t.after(async () => { await service.close(); rmSync(directory, { recursive: true, force: true }); });
+  for (const me of ['claude', 'codex']) {
+    const started = Date.now();
+    const client = new Client({ name: 'test', version: '1' });
+    await client.connect(new StdioClientTransport({ command: process.execPath, args: [resolve('src/launch.js'), me], env: env({ BRIDGE_STATE_DIR: directory }), stderr: 'pipe' }));
+    const names = (await client.listTools()).tools.map(x => x.name);
+    await client.close();
+    assert.ok(names.length > 0 && names.every(n => !n.startsWith(me + '_')), me);
+    assert.ok(Date.now() - started < 5000, `${me} launch took ${Date.now() - started} ms`);
+  }
+});
+
+test('a hung info request is aborted: the service sees its connection close', linux, async t => {
+  let requests = 0; const closed = Promise.withResolvers();
+  await withRegistered(t, { http: (req, res) => {
+    if (++requests === 1) { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ version: '2.2.5', pid: process.pid, urls: [], paths: { tmp: '/tmp' } })); return; }
+    req.on('close', () => closed.resolve(true));
+  } });
+  const started = Date.now();
+  const r = await openCodeProbe()();
+  assert.equal(r.status, 'unreachable');
+  assert.ok(Date.now() - started < READY_MS * 0.8, `took ${Date.now() - started} ms`);
+  assert.equal(requests, 2, 'discover answered and info was the hung request');
+  assert.equal(await Promise.race([closed.promise, new Promise(res => setTimeout(res, 1500, false))]), true);
+});
+
+test('a registration run by the other client is reported as stale, only on a confident match', () => {
+  assert.match(staleRegistration('claude', 'codex-mcp-client'), /registered as "claude".*Codex.*re-run/is);
+  assert.match(staleRegistration('codex', 'claude-code'), /registered as "codex".*Claude Code.*re-run/is);
+  assert.match(staleRegistration('opencode', 'claude-code'), /registered as "opencode"/);
+  assert.equal(staleRegistration('codex', 'codex-mcp-client'), null);
+  assert.equal(staleRegistration('claude', 'claude-code'), null);
+  for (const name of ['opencode', 'Codex', 'codex', 'claude-code-extra', 'my-codex-mcp-client', 'inspector', '', '__proto__', 'constructor', undefined, null, 7, {}])
+    assert.equal(staleRegistration('claude', name), null, String(name));
+});
+
+test('initialize warns once on stderr about a stale registration and never fails or changes its answer', async () => {
+  const run = async (clientName, ...rest) => {
+    const client = new Client({ name: clientName, version: '1' });
+    const transport = new StdioClientTransport({ command: process.execPath, args: [resolve('src/mcp-client.js')], env: env({ BRIDGE_CLIENT: 'claude' }), stderr: 'pipe' });
+    let text = ''; transport.stderr.on('data', d => { text += d; });
+    await client.connect(transport);
+    const tools = (await client.listTools()).tools.length;
+    await client.ping(); await client.close();
+    return { text, tools };
+  };
+  const stale = await run('codex-mcp-client');
+  assert.equal(stale.text.match(/stale/g)?.length, 1, stale.text);
+  assert.match(stale.text, /re-run/i);
+  assert.ok(stale.tools > 0);
+  for (const same of ['claude-code', 'something-else', 'opencode']) assert.equal((await run(same)).text, '', same);
 });

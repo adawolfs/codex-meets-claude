@@ -32,16 +32,18 @@ function clientVersion(){
  return 'unknown';
 }
 // Read-only: discover() never starts a service and the only request is server.info(); no inference, no credential check beyond the registered ones.
-export const openCodeProbe=({service=Service,connect=o=>OpenCode.make(o),timeoutMs=2000}={})=>async()=>{
+// The budget must stay well under launch.js's 1000 ms readiness timeout: a wedged OpenCode service must never stop Claude or Codex launching.
+// A timed-out info request is aborted. discover() takes no signal, but its own probe is capped at 2 s by the client.
+export const openCodeProbe=({service=Service,connect=o=>OpenCode.make(o),timeoutMs=500}={})=>async()=>{
  const out=(status,version=null)=>({status,serviceVersion:typeof version==='string'&&version?version.slice(0,64):null,clientVersion:clientVersion()});
- let timer;
+ let timer;const abort=new AbortController();
  try{
   return await Promise.race([(async()=>{
    const live=await service.discover();
    if(!live)return out('unreachable');
-   const {version}=await connect({baseUrl:live.url,headers:service.headers(live)}).server.info();
+   const {version}=await connect({baseUrl:live.url,headers:service.headers(live)}).server.info({signal:abort.signal});
    return out(/^2\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$/.test(version)?'ready':'incompatible',version);
-  })(),new Promise(r=>{timer=setTimeout(r,timeoutMs,out('unreachable'));})]);
+  })(),new Promise(r=>{timer=setTimeout(()=>{abort.abort();r(out('unreachable'));},timeoutMs);})]);
  }catch{return out('unreachable');}finally{clearTimeout(timer);}
 };
 export async function startService({directory=stateDirectory(),probeOpenCode=openCodeProbe(),runner=createRunner({timeoutMs:Number(process.env.BRIDGE_TIMEOUT_MS||3600000)}),resolveProject,maxActive=Number(process.env.BRIDGE_MAX_ACTIVE||4),maxQueued=Number(process.env.BRIDGE_MAX_QUEUED||100)}={}){

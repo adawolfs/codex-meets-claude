@@ -42,3 +42,12 @@ export function surface(client){
  for(const provider of PROVIDERS.filter(p=>p!==client))for(const tool of toolsFor(provider)){tools.push(tool);byName.set(tool.name,{provider,action:tool.name.slice(provider.length+1)});}
  return {tools,resolve:name=>typeof name==='string'?byName.get(name):undefined};
 }
+// MCP clientInfo.name values observed on the wire (Claude Code 2.1.316 and Codex 0.166.0, 2026-10-31). Exact matches only;
+// an unlisted name, OpenCode included, is never treated as a mismatch.
+const CLIENT_NAMES=new Map([['claude-code',['claude','Claude Code']],['codex-mcp-client',['codex','Codex']]]);
+// Releases before 0.4.0 registered each client under the provider it served, so an old entry names the wrong client.
+export function staleRegistration(registered,clientName){
+ const known=typeof clientName==='string'?CLIENT_NAMES.get(clientName):undefined;
+ if(!known||known[0]===registered)return null;
+ return `agent-bridge: this server is registered as "${registered}" but is being run by ${known[1]}. The registration is stale: older versions registered each client under the provider it called, not under its own name. Re-run the installer (node scripts/configure-clients.js) so it is registered as "${known[0]}"; until then this client is offered the wrong tools.`;
+}
