@@ -170,7 +170,7 @@ test('cancel interrupts the session and cannot be overwritten by a late result',
   const early = other.start({ prompt: 'x', cwd });
   other.cancel(early.id);
   assert.equal((await other.wait(early.id)).status, 'cancelled');
-  assert.equal(fresh.service.ensure.calls.length, 0);
+  assert.equal(fresh.service.discover.calls.length, 0);
 });
 
 test('timeout interrupts and reports timed_out', async () => {
@@ -188,7 +188,7 @@ test('timeout interrupts and reports timed_out', async () => {
   await deaf.shutdown();
   assert.equal(quiet.open(), 0);
   // A service that never answers still times out.
-  const stuck = new OpenCodeJobs({ ...fakeOpenCode({ script: { 'service.ensure': () => new Promise(() => {}) } }), timeoutMs: 20 });
+  const stuck = new OpenCodeJobs({ ...fakeOpenCode({ script: { 'service.discover': () => new Promise(() => {}) } }), timeoutMs: 20 });
   assert.equal((await stuck.wait(stuck.start({ prompt: 'x', cwd }).id)).status, 'timed_out');
 });
 
@@ -244,7 +244,7 @@ test('oversized messages and excess concurrency are bounded', async () => {
 });
 
 test('resume prompts the recorded session instead of creating one', async () => {
-  const marked = level => ({ 'session.get': ({ sessionID }) => ({ id: sessionID, metadata: { agentbridge: { level } } }) });
+  const marked = level => ({ 'session.get': ({ sessionID }) => ({ id: sessionID, location: { directory: cwd }, metadata: { agentbridge: { level } } }) });
   const { client, service, emit } = fakeOpenCode({ script: marked('build') });
   const jobs = new OpenCodeJobs({ client, service });
   const job = jobs.start({ prompt: 'again', cwd, sessionId: 's1', level: 'build', model: 'anthropic/claude-sonnet-4.5' });
@@ -277,6 +277,94 @@ test('resume refuses sessions the bridge did not create, and a different level',
     assert.equal(fake.client.session.prompt.calls.length, 0);
     assert.equal(fake.stats.opened, 0);
   }
+});
+
+test('resume refuses a session created in another directory, since a prompt cannot move it', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const other = mkdtempSync('/tmp/opencode/bridge-elsewhere-');
+  try {
+    const fake = fakeOpenCode({ script: { directory: other } });
+    const jobs = new OpenCodeJobs(fake);
+    const result = await jobs.wait(jobs.start({ prompt: 'x', cwd, sessionId: 's1' }).id);
+    assert.equal(result.status, 'failed');
+    assert.match(result.error, /Session works in .*bridge-elsewhere-.*, not in cwd/);
+    assert.equal(fake.client.session.prompt.calls.length, 0);
+    assert.equal(fake.stats.opened, 0);
+    // The same session resumed from its own directory runs.
+    const ok = new OpenCodeJobs(fakeOpenCode({ script: { directory: other } }));
+    const job = ok.start({ prompt: 'x', cwd: other, sessionId: 's1' });
+    await tick();
+    assert.equal(ok.status(job.id).status, 'running');
+    await ok.shutdown();
+  } finally { rmSync(other, { recursive: true, force: true }); }
+});
+
+test('with no OpenCode service running the job fails with a clear message and starts nothing', async () => {
+  const fake = fakeOpenCode({ script: { 'service.discover': () => null } });
+  const jobs = new OpenCodeJobs(fake);
+  const result = await jobs.wait(jobs.start({ prompt: 'x', cwd }).id);
+  assert.equal(result.status, 'failed');
+  assert.match(result.error, /No OpenCode service is running.*never starts one/);
+  assert.equal(fake.service.ensure, undefined);
+  assert.equal(fake.client.session.create.calls.length, 0);
+});
+
+test('the effective agent\'s rules bound the level, and the session runs as that agent', async () => {
+  const rule = (action, effect, resource = '*') => ({ action, resource, effect });
+  const config = [{ type: 'document', info: { permissions: [rule('websearch', 'deny')], default_agent: 'review' } }, { type: 'document', info: { permissions: [rule('glob', 'deny')] } }];
+  const agents = { data: [
+    { id: 'build', mode: 'primary', permissions: [rule('*', 'allow'), rule('websearch', 'deny'), rule('glob', 'deny')] },
+    // agents.review.permissions denies edit after the global rules: the edit level must not override it.
+    { id: 'review', mode: 'primary', permissions: [rule('*', 'allow'), rule('websearch', 'deny'), rule('glob', 'deny'), rule('edit', 'deny')] },
+  ] };
+  const fake = fakeOpenCode({ script: { config, 'agent.list': () => agents } });
+  const jobs = new OpenCodeJobs(fake);
+  const job = jobs.start({ prompt: 'x', cwd, level: 'edit' });
+  await tick();
+  const created = fake.client.session.create.calls[0];
+  assert.equal(created.agent, 'review');
+  assert.deepEqual(created.permissions, levelRules('edit', { config: agents.data[1].permissions }));
+  assert.equal(created.permissions.findLast(r => r.action === 'edit' || r.action === '*').effect, 'deny');
+  assert.deepEqual(fake.client.agent.list.calls[0], { location: { directory: cwd } });
+  fake.emit(succeeded);
+  await jobs.wait(job.id);
+  await jobs.shutdown();
+  // Without default_agent it is build; an unknown or subagent default fails; rules missing the configuration fail.
+  for (const [script, pattern] of [
+    [{ config: [{ type: 'document', info: { default_agent: 'nope' } }] }, /no primary agent "nope"/],
+    [{ config: [{ type: 'document', info: { default_agent: 'general' } }], 'agent.list': () => ({ data: [{ id: 'general', mode: 'subagent', permissions: [] }] }) }, /no primary agent "general"/],
+    [{ config, 'agent.list': () => ({ data: [{ id: 'review', mode: 'primary', permissions: [rule('*', 'allow')] }] }) }, /do not include the configuration/],
+    [{ 'agent.list': () => [] }, /invalid agent list/],
+  ]) {
+    const other = fakeOpenCode({ script });
+    const run = new OpenCodeJobs(other);
+    const result = await run.wait(run.start({ prompt: 'x', cwd, level: 'edit' }).id);
+    assert.equal(result.status, 'failed');
+    assert.match(result.error, pattern);
+    assert.equal(other.client.session.create.calls.length, 0);
+  }
+  const plain = fakeOpenCode();
+  const p = new OpenCodeJobs(plain);
+  p.start({ prompt: 'x', cwd });
+  await tick();
+  assert.equal(plain.client.session.create.calls[0].agent, 'build');
+  await p.shutdown();
+});
+
+test('the configuration is read at configCwd while the session runs in cwd', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const source = mkdtempSync('/tmp/opencode/bridge-source-');
+  try {
+    const fake = fakeOpenCode();
+    const jobs = new OpenCodeJobs(fake);
+    jobs.start({ prompt: 'x', cwd, configCwd: source });
+    await tick();
+    assert.deepEqual(fake.client.config.get.calls[0], { location: { directory: source } });
+    assert.deepEqual(fake.client.agent.list.calls[0], { location: { directory: source } });
+    assert.deepEqual(fake.client.session.create.calls[0].location, { directory: cwd });
+    assert.throws(() => jobs.start({ prompt: 'x', cwd, configCwd: 'relative' }), /configCwd/);
+    await jobs.shutdown();
+  } finally { rmSync(source, { recursive: true, force: true }); }
 });
 
 test('a cancel during the prompt lets the prompt land before interrupting', async () => {
@@ -434,7 +522,7 @@ test('invalid requests are rejected before contacting OpenCode', () => {
   const jobs = new OpenCodeJobs(fake);
   for (const args of [{ prompt: '' }, { cwd: 'relative' }, { level: 'admin' }, { worktree: true }, { worktree: 'yes' }, { model: 'no-provider' }, { model: '/b' }, { model: 'a/' }, { sessionId: '../bad' }])
     assert.throws(() => jobs.start({ prompt: 'x', cwd, ...args }));
-  assert.equal(fake.service.ensure.calls.length, 0);
+  assert.equal(fake.service.discover.calls.length, 0);
   assert.throws(() => new OpenCodeJobs({ ...fake, maxEvents: 0 }));
 });
 

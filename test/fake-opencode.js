@@ -38,9 +38,11 @@ export function fakeOpenCode({ script = {} } = {}) {
   const call = (name, fallback) => input => (script[name] ?? fallback)(input);
   const client = {
     config: { get: spy(call('config.get', () => script.config ?? [])) },
+    // As measured on 2.2.5: an agent's rules carry every configuration file's, in order, then its own.
+    agent: { list: spy(call('agent.list', ({ location }) => ({ location, data: [{ id: 'build', mode: 'primary', permissions: (script.config ?? []).flatMap(e => e?.info?.permissions ?? []) }] }))) },
     session: {
       create: spy(call('session.create', () => ({ id: script.sessionId ?? 's1' }))),
-      get: spy(call('session.get', ({ sessionID }) => ({ id: sessionID, metadata: { agentbridge: { level: 'read-only' } } }))),
+      get: spy(call('session.get', ({ sessionID }) => ({ id: sessionID, location: { directory: script.directory ?? process.cwd() }, metadata: { agentbridge: { level: 'read-only' } } }))),
       switchModel: spy(call('session.switchModel', () => undefined)),
       prompt: spy(call('session.prompt', () => ({}))),
       // A real interrupt ends the running turn, which the stream reports.
@@ -51,7 +53,7 @@ export function fakeOpenCode({ script = {} } = {}) {
   };
   client.event.subscribe.calls = [];
   const service = {
-    ensure: spy(call('service.ensure', () => ({ url: 'http://bridge:secret@127.0.0.1:4096', auth: { type: 'basic', username: 'bridge', password: 'secret' } }))),
+    discover: spy(call('service.discover', () => ({ url: 'http://bridge:secret@127.0.0.1:4096', auth: { type: 'basic', username: 'bridge', password: 'secret' } }))),
     headers: () => ({ authorization: 'Basic c2VjcmV0' }),
   };
   return { client, service, emit, stats, open: () => subscribers.size };

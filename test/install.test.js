@@ -153,11 +153,10 @@ test('a failed opencode write unwinds the codex and claude writes',{skip:process
  try{assert.throws(()=>configureClients({home:f.home,platform:'linux',node:'/node',repo:'/repo'}),/EACCES/);}finally{chmodSync(dir,0o700);}
  assert.equal(readFileSync(f.claude,'utf8'),claude);assert.equal(readFileSync(f.codex,'utf8'),toml);assert.equal(readFileSync(f.oc,'utf8'),oc);
 });
-test('the unit carries OPENCODE_COMMAND when given and stays valid without it',()=>{
+test('the unit never carries an OpenCode command: the service attaches and never spawns one',()=>{
  const a={node:'/node',repo:'/repo',home:'/home/a',claude:'/claude',codex:'/codex',directory:'/state'};
- assert.match(serviceUnit({...a,opencode:'/home/a/.opencode/bin/opencode'}),/Environment="OPENCODE_COMMAND=\/home\/a\/\.opencode\/bin\/opencode"/);
- assert.doesNotMatch(serviceUnit(a),/OPENCODE_COMMAND/);
- assert.throws(()=>serviceUnit({...a,opencode:'/o\nbad'}));
+ assert.doesNotMatch(serviceUnit({...a,opencode:'/home/a/.opencode/bin/opencode'}),/OPENCODE_COMMAND|opencode/);
+ assert.equal(serviceUnit({...a,opencode:'/x'}),serviceUnit(a));
 });
 test('a missing OpenCode binary warns on stderr and does not block, a present one is silent',()=>{
  const seen=[];assert.equal(checkOpenCode('/no/such/opencode',m=>seen.push(m)),false);

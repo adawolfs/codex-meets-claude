@@ -168,7 +168,8 @@ export class Coordinator {
     if(!row||!existsSync(row.path))throw Error(`Worktree ${view.worktree.path} no longer exists; the job was not started`);
     record.worktree=row;
     const sub=join(row.path,relative(row.project,record.args.cwd));
-    return {...record.args,cwd:inside(row.path,sub)&&existsSync(sub)?sub:row.path,worktree:false};
+    // The configuration is read at the source: the tree's own ancestors are the state directory's.
+    return {...record.args,cwd:inside(row.path,sub)&&existsSync(sub)?sub:row.path,configCwd:record.args.cwd,worktree:false};
   }
   // Removes only a provably clean tree, and never one a delegate may still write to or another job is waiting to use.
   // An interrupted job keeps its tree: interruption is the state that anticipates an explicit resume.

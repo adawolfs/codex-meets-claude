@@ -22,6 +22,15 @@ const confirmed = (fn, ms) => {
 const TERMINAL = /^session\.execution\.(succeeded|failed|interrupted)$/;
 // Metadata key marking sessions this bridge created; only those may be resumed.
 const MARK = 'agentbridge';
+// The agent a session runs as: the configuration's last default_agent, else OpenCode's default, build. It is passed to
+// the session explicitly, so the agent whose rules are replayed is the one that runs.
+function effectiveAgent(entries, agents) {
+  const wanted = entries.findLast(entry => typeof entry?.info?.default_agent === 'string')?.info.default_agent ?? 'build';
+  const agent = agents.find(a => a?.id === wanted);
+  if (!agent || agent.mode === 'subagent' || !Array.isArray(agent.permissions))
+    throw new Error(`OpenCode has no primary agent "${bounded(wanted, 64)}" to run the session as; fix default_agent in the configuration`);
+  return agent;
+}
 
 /** One OpenCode session turn per job, driven over the shared local service's HTTP API. */
 export class OpenCodeJobs {
@@ -40,12 +49,16 @@ export class OpenCodeJobs {
     this.closing = false;
   }
 
-  start({ prompt, cwd, sessionId, model, level = 'read-only', worktree } = {}) {
+  // configCwd is where the user's configuration is read: a worktree job's source checkout, whose ancestors and ignored
+  // .opencode files the worktree under the state directory does not have.
+  start({ prompt, cwd, configCwd, sessionId, model, level = 'read-only', worktree } = {}) {
     if (this.closing) throw new Error('Server is shutting down');
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 100000)
       throw new Error('prompt must be a nonempty string of at most 100000 characters');
     if (typeof cwd !== 'string' || !isAbsolute(cwd) || !statSync(cwd).isDirectory())
       throw new Error('cwd must be an existing absolute directory');
+    if (configCwd !== undefined && (typeof configCwd !== 'string' || !isAbsolute(configCwd) || !statSync(configCwd).isDirectory()))
+      throw new Error('configCwd must be an existing absolute directory');
     if (sessionId !== undefined && (typeof sessionId !== 'string' || !/^[a-zA-Z0-9._-]{1,128}$/.test(sessionId)))
       throw new Error('Invalid sessionId');
     if (model !== undefined && (typeof model !== 'string' || !MODEL.test(model)))
@@ -81,7 +94,7 @@ export class OpenCodeJobs {
     this.jobs.set(view.id, record);
     const [, providerID, id, variant] = model?.match(MODEL) ?? [];
     // Defer launch so immediate cancellation is observed before contacting OpenCode.
-    record.done = Promise.resolve().then(() => this.run(record, { prompt, sessionId, level, model: model && { providerID, id, ...(variant ? { variant } : {}) } }));
+    record.done = Promise.resolve().then(() => this.run(record, { prompt, sessionId, level, configCwd: configCwd ?? cwd, model: model && { providerID, id, ...(variant ? { variant } : {}) } }));
     return this.snapshot(record);
   }
 
@@ -93,23 +106,38 @@ export class OpenCodeJobs {
     const step = promise => Promise.race([promise, aborted]);
     try {
       if (signal.aborted) return;
-      const endpoint = await step(this.service.ensure());
+      // Attach only: a service started from here would live in the bridge's cgroup and die with every bridge restart.
+      const endpoint = await step(this.service.discover());
+      if (!endpoint?.url) throw new Error('No OpenCode service is running. Start OpenCode (open it, or run "opencode serve --service") and retry; the bridge attaches to a running service and never starts one');
       const client = record.client = this.client ?? OpenCode.make({ baseUrl: endpoint.url, headers: this.service.headers(endpoint) });
       view.openCode.endpoint = publicUrl(endpoint.url);
       let sessionID = request.sessionId;
       if (sessionID) {
         // A resumed session keeps the rules it was created with; its permissions are never rewritten.
-        const mark = (await step(client.session.get({ sessionID })))?.metadata?.[MARK];
+        const session = await step(client.session.get({ sessionID })), mark = session?.metadata?.[MARK];
         if (!mark || typeof mark !== 'object') throw new Error('Session was not created by the bridge, so it cannot be resumed by it');
         if (mark.level !== request.level)
           throw new Error(`Session was created at level "${bounded(mark.level, 32)}"; resume it at that level or start a new job`);
+        // A prompt takes no location: the delegate works where the session was created, which is what was locked.
+        if (session.location?.directory !== view.cwd)
+          throw new Error(`Session works in ${bounded(session.location?.directory, 1024)}, not in cwd ${bounded(view.cwd, 1024)}; resume it with its own cwd (or parentJobId)`);
         if (request.model) await step(client.session.switchModel({ sessionID, model: request.model }));
       } else {
-        const entries = await step(client.config.get({ location: { directory: view.cwd } }));
+        const at = { location: { directory: request.configCwd } };
+        const [entries, agents] = await step(Promise.all([client.config.get(at), client.agent.list(at)]));
         if (!Array.isArray(entries)) throw new Error('OpenCode returned an invalid configuration');
-        const permissions = levelRules(request.level, { config: entries.flatMap(entry => entry?.info?.permissions ?? []) });
+        if (!Array.isArray(agents?.data)) throw new Error('OpenCode returned an invalid agent list');
+        const agent = effectiveAgent(entries, agents.data);
+        // The agent's resolved rules are the session's base: built-in defaults, then every configuration file's rules
+        // (lowest precedence first), then agents.<id>.permissions. Replaying them alone keeps OpenCode's order; anything
+        // else could let a later allow undo a deny. Should they ever stop carrying the configuration, the job fails.
+        const config = entries.flatMap(entry => entry?.info?.permissions ?? []);
+        let next = 0;
+        for (const r of agent.permissions) if (next < config.length && ['action', 'resource', 'effect'].every(k => r?.[k] === config[next]?.[k])) next++;
+        if (next < config.length) throw new Error(`OpenCode's rules for agent "${bounded(agent.id, 64)}" do not include the configuration's, so the level cannot be bounded by it`);
+        const permissions = levelRules(request.level, { config: agent.permissions });
         const session = await step(client.session.create({
-          location: { directory: view.cwd }, ...(request.model ? { model: request.model } : {}),
+          location: { directory: view.cwd }, agent: agent.id, ...(request.model ? { model: request.model } : {}),
           permissions, metadata: { [MARK]: { level: request.level } },
         }));
         sessionID = session?.id;

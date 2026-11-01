@@ -135,3 +135,56 @@ test('live OpenCode: session permissions override a global edit deny, and merge 
   const ungated = await arm('ungated', readOnly, { deny: false });
   assert.ok(wrote(ungated).some(e => e.ok), `read-only session without a config deny could not write: ${JSON.stringify(ungated)}`);
 });
+
+// Model-free (no prompt reaches a model), so it costs no quota: the real service resolves the configuration and the
+// agent, and the adapter creates a real session from them; its prompt is stubbed to fail before any inference.
+test('live OpenCode, no model: configuration order, the effective agent and the session location the adapter relies on', { skip: !enabled, timeout: 60000 }, async t => {
+  const { execFileSync } = await import('node:child_process');
+  const { OpenCodeJobs } = await import('../src/opencode-jobs.js');
+  const { levelRules } = await import('../src/opencode-levels.js');
+  const live = await Service.discover();
+  assert.ok(live, 'no OpenCode service is running; start one first');
+  const real = OpenCode.make({ baseUrl: live.url, headers: Service.headers(live) });
+  const sessions = [];
+  const client = { ...real, session: { ...real.session, prompt: async () => { throw new Error('stubbed: no model in this probe'); } } };
+  await mkdir('/tmp/opencode', { recursive: true });
+  const root = await mkdtemp('/tmp/opencode/order-'), repo = join(root, 'repo'), pkg = join(repo, 'pkg');
+  t.after(async () => {
+    for (const sessionID of sessions) await real.session.remove({ sessionID }).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  });
+  await mkdir(join(repo, '.opencode'), { recursive: true });
+  await mkdir(pkg);
+  execFileSync('git', ['init', '-q', repo]);
+  const rule = (action, effect) => ({ action, resource: '*', effect });
+  const files = {
+    [join(root, 'opencode.json')]: { permissions: [rule('websearch', 'deny')], default_agent: 'plan', agents: { plan: { permissions: [rule('webfetch', 'deny')] } } },
+    [join(repo, 'opencode.json')]: { permissions: [rule('websearch', 'allow')] },
+    [join(pkg, 'opencode.json')]: { permissions: [rule('glob', 'deny')] },
+    [join(repo, '.opencode', 'opencode.json')]: { permissions: [rule('grep', 'deny')] },
+  };
+  for (const [path, body] of Object.entries(files)) await writeFile(path, JSON.stringify(body));
+
+  // Entries come lowest precedence first: the outer ancestor (above the git root, too), inner ones, then .opencode.
+  const entries = await real.config.get({ location: { directory: pkg } });
+  const order = entries.map(e => e.path).filter(p => p in files);
+  assert.deepEqual(order, [join(root, 'opencode.json'), join(repo, 'opencode.json'), join(pkg, 'opencode.json'), join(repo, '.opencode', 'opencode.json')], JSON.stringify(entries.map(e => e.path)));
+  // The agent's resolved rules carry those, in that order, then agents.<id>.permissions.
+  const plan = (await real.agent.list({ location: { directory: pkg } })).data.find(a => a.id === 'plan');
+  const mine = plan.permissions.filter(r => ['websearch', 'glob', 'grep', 'webfetch'].includes(r.action) && r.resource === '*');
+  assert.deepEqual(mine, [rule('websearch', 'deny'), rule('websearch', 'allow'), rule('glob', 'deny'), rule('grep', 'deny'), rule('webfetch', 'deny')]);
+
+  // The adapter runs the session as default_agent, bounded by that agent's rules, where it was asked to.
+  const jobs = new OpenCodeJobs({ client, closeMs: 3000, drainMs: 100 });
+  const view = await jobs.wait(jobs.start({ prompt: 'x', cwd: pkg, level: 'edit' }).id);
+  assert.match(view.error ?? '', /stubbed/, JSON.stringify(view));
+  sessions.push(view.sessionId);
+  const session = await real.session.get({ sessionID: view.sessionId });
+  assert.equal(session.agent, 'plan');
+  assert.equal(session.location.directory, pkg);
+  assert.deepEqual(session.permissions, levelRules('edit', { config: plan.permissions }));
+  // A resume from another directory is refused before any prompt.
+  const moved = await jobs.wait(jobs.start({ prompt: 'x', cwd: repo, sessionId: view.sessionId, level: 'edit' }).id);
+  assert.match(moved.error, /Session works in/);
+  await jobs.shutdown();
+});

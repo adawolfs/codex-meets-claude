@@ -72,6 +72,7 @@ test('a job started from a subdirectory runs in the same subdirectory of its wor
   const repo=makeRepo(t),f=setup(t);
   const view=await run(f,join(repo,'sub'),{write:'b.js'});
   assert.equal(f.seen[0].cwd,join(view.worktree.path,'sub'));
+  assert.equal(f.seen[0].configCwd,join(repo,'sub'),'configuration is read at the source, with its ancestors and ignored files');
   assert.deepEqual(view.worktree.changedFiles,['sub/b.js']);
 });
 
